@@ -1,0 +1,30 @@
+name: check
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: compile
+        run: python3 -m py_compile bin/forge bin/guard.py
+      - name: guard blocks git writes
+        run: |
+          echo '{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}' | python3 bin/guard.py && exit 1 || test $? -eq 2
+      - name: guard allows read-only git
+        run: |
+          echo '{"tool_name":"Bash","tool_input":{"command":"git status && git log -1 && git remote -v"}}' | python3 bin/guard.py
+      - name: guard confines writes to the worktree
+        run: |
+          mkdir -p /tmp/wt /tmp/main
+          export FORGE_WRITE_ROOT=/tmp/wt FORGE_PROTECT=/tmp/main
+          echo '{"tool_name":"Edit","tool_input":{"file_path":"/tmp/wt/a.kt"}}' | python3 bin/guard.py
+          echo '{"tool_name":"Edit","tool_input":{"file_path":"/tmp/main/a.kt"}}' | python3 bin/guard.py && exit 1 || test $? -eq 2
+          echo '{"tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ /tmp/main/a.kt"}}' | python3 bin/guard.py && exit 1 || test $? -eq 2
+      - name: help runs without a config
+        run: python3 bin/forge help | head -3
