@@ -1,0 +1,2458 @@
+#!/usr/bin/env python3
+"""forge — parallel Claude Code workers, one human committer.
+
+  forge init                      check claude/git, write worker settings
+  forge login | logout | whoami   forge's own Claude login (separate from yours); agents run as it
+  forge version                   installed version vs the running loop's
+  forge why <id>                  why a task failed or waits, in the worker's own words, and the one command that moves it
+  forge discover <decisions.md> --project NAME   product team pass: questions first, then backlog+ADRs+tests+costs
+  forge discover answer NAME      walk the blocking questions one by one; writes ## ANSWERS into the decisions doc
+  forge backlog render|show|resolve|approve NAME   resolve walks challenger findings one by one into decisions; approve creates issues + tickets/ + CLAUDE.md
+  forge finance report [--post]   agent spend ledger + project run-cost view; --post sends to Slack
+  forge ticket <key>              fetch the ticket via the tracker CLI (gh / twg) -> tickets/<key>.md
+  forge refine COS-1              refiner checks the ticket is ready; writes plans/COS-1/refine.{json,md}
+  forge refine show COS-1         print questions and verdict
+  forge refine post COS-1         post the open questions to Jira as one comment (asks first)
+  forge refine accept COS-1       mark READY (required before planning unless --force)
+  forge plan COS-1 [--repo NAME]  planner (strong model) -> plans/COS-1/plan.{json,md}  [nothing runs yet]; repo from the ticket's `repo:` line or --repo
+  forge plan show COS-1           print the plan
+  forge plan revise COS-1 "fb"    re-plan with your feedback (edit plan.json by hand if you prefer)
+  forge plan approve COS-1        turn the plan into tasks; workers may now pick them up
+  forge plan withdraw COS-1       undo approve while nothing has started; plan goes back to draft
+  forge plan list                 all plans and their status
+  forge add "<goal>" --issue N --repo NAME [--accept "<cmd>"]...   one task, no planner (default-tier model)
+  forge rm <id>                   delete a queued/failed/owner task (stops its worker, removes its worktree)
+  forge run                       one scheduler tick: reap, review, start workers
+  forge loop [--every 120]        run ticks forever (foreground)
+  forge status [--all] [--legend] [--digest]   tasks in plan order with a note per row; closed tickets collapsed unless --all
+  forge review [id] [--open]      next item waiting for you, then a prompt: m merge | p PR | c commit | r reject | d diff | n next | q; --open also opens the worktree in your editor
+  forge approve <id> [-m msg] [--pr]   commit as YOU in the worktree, push, optional PR
+  forge reject <id> "<reason>"    send back to the worker for rework
+  forge clean <id>|--done         remove worktrees (and branches if not approved)
+  forge owner run <id>            run an owner step's script, judge the JUnit evidence, record it, approve on green
+  forge doctor [check ...]        environment preflight with a fix per failure (tools account loop repos android_device local_server docker)
+  forge help [command]            long-form help; also forge <command> --help
+"""
+import json, os, random, re, shlex, shutil, subprocess, sys, time, urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "81"
+ROOT = Path(__file__).resolve().parent.parent
+CFG_PATH = ROOT / "forge.json"
+TASKS = ROOT / "tasks"
+LOGS = ROOT / "logs"
+PROMPTS = ROOT / "prompts"
+WT_ROOT = ROOT / ".worktrees"
+def repos(c):
+    """{name: path}. Values in forge.json may be a path string or {path, test_cmd, lint_cmd}. Falls back to {'default': c['repo']}."""
+    r = {k: v for k, v in (c.get("repos") or {}).items() if not k.startswith("_")}
+    out = {k: os.path.expanduser(v["path"] if isinstance(v, dict) else v) for k, v in r.items()}
+    return out or {"default": c["repo"]}
+
+def repo_for(c, spec_or_name):
+    """(name, path, test_cmd, lint_cmd) for a task spec / ticket repo tag. Unknown or missing tag -> first repo + global cmds."""
+    name = spec_or_name.get("repo") if isinstance(spec_or_name, dict) else spec_or_name
+    rs = repos(c); raw = {k: v for k, v in (c.get("repos") or {}).items() if not k.startswith("_")}
+    if name not in rs: name = next(iter(rs))
+    v = raw.get(name, {}); v = v if isinstance(v, dict) else {}
+    return name, rs[name], v.get("test_cmd") or c["test_cmd"], v.get("lint_cmd") or c.get("lint_cmd", "")
+
+def plans_dir(c):
+    p = Path(os.path.expanduser(c.get("plans_dir") or str(ROOT / "plans")))
+    p.mkdir(parents=True, exist_ok=True); return p
+WORKER_SETTINGS = ROOT / "templates" / "worker.settings.json"
+REVIEWER_SETTINGS = ROOT / "templates" / "reviewer.settings.json"
+
+HUMAN_STATES = {"needs_human", "blocked", "failed"}
+ACTIVE_STATES = {"running", "reviewing"}
+
+# ---------------------------------------------------------------- helpers
+
+def cfg():
+    c = json.loads(CFG_PATH.read_text())
+    rs = {k: v for k, v in (c.get("repos") or {}).items() if not k.startswith("_")}
+    if rs and not Path(os.path.expanduser(c.get("repo", ""))).is_dir():
+        first = next(iter(rs.values())); first = first["path"] if isinstance(first, dict) else first
+        c["repo"] = os.path.expanduser(first)   # first mapped repo is the default
+    if not Path(os.path.expanduser(c["repo"])).is_dir():
+        die(f"forge.json: repo '{c['repo']}' is not a directory (set repo, or repos)")
+    c["repo"] = os.path.expanduser(c["repo"])
+    return c
+
+def die(msg, code=1):
+    print(f"forge: {msg}", file=sys.stderr); sys.exit(code)
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def sh(cmd, cwd=None, check=True, capture=True, env=None):
+    r = subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), text=True,
+                       capture_output=capture, env=env)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"{cmd!r} failed ({r.returncode}): {r.stderr.strip()[:800]}")
+    return r
+
+def task_dir(tid): return TASKS / tid
+def load(tid, name):
+    p = task_dir(tid) / name
+    return json.loads(p.read_text()) if p.exists() else None
+def save(tid, name, obj):
+    task_dir(tid).mkdir(parents=True, exist_ok=True)
+    (task_dir(tid) / name).write_text(json.dumps(obj, indent=2))
+def set_state(tid, state, **extra):
+    st = load(tid, "state.json") or {"id": tid, "history": []}
+    st["state"] = state; st["updated"] = now(); st.update(extra)
+    st.setdefault("history", []).append({"t": now(), "state": state})
+    save(tid, "state.json", st); return st
+def all_tasks():
+    out = []
+    if TASKS.exists():
+        for d in sorted(TASKS.iterdir()):
+            if (d / "spec.json").exists():
+                out.append((d.name, load(d.name, "spec.json"), load(d.name, "state.json") or {"state": "queued"}))
+    return out
+
+TRACKER_PRESETS = {
+    "jira":   {"view": "twg view {key}", "comment": "twg comment {key} {text}", "transition": "twg transition {key} {state}",
+               "create": "", "states": {"in_progress": "In Progress", "in_review": "In Review"},
+               "key_pattern": r"[A-Z][A-Z0-9]{1,9}-\d+", "commit_prefix": "{key}", "branch_key": "{key}"},
+    "github": {"view": "gh issue view {key} --comments", "comment": "gh issue comment {key} --body {text}",
+               "transition": "gh issue edit {key} --add-label {state}",
+               "create": "gh issue create --title {title} --body {text} --label forge",
+               "states": {"in_progress": "in progress", "in_review": "in review"},
+               "repo": "", "key_pattern": r"\d{1,6}", "commit_prefix": "#{key}", "branch_key": "{key}"},
+    "none":   {"view": "", "comment": "", "transition": "", "create": "", "states": {}, "key_pattern": r"[A-Za-z][\w-]{0,40}", "commit_prefix": "{key}", "branch_key": "{key}"},
+}
+def tracker(c):
+    t = dict(TRACKER_PRESETS.get((c.get("tracker") or {}).get("kind", "none"), TRACKER_PRESETS["none"]))
+    t.update({k: v for k, v in (c.get("tracker") or {}).items() if not k.startswith("_")})
+    if "jira" in c and "tracker" not in c:   # backwards compat with v4 config
+        t = dict(TRACKER_PRESETS["jira"]); t.update({k: v for k, v in c["jira"].items() if not k.startswith("_")}); t["kind"] = "jira"
+    return t
+
+def tracker_key(c, *texts):
+    pat = re.compile(r"(?<![\w/])#?(" + tracker(c)["key_pattern"] + r")\b")
+    for t in texts:
+        m = pat.search(t or "")
+        if m: return m.group(1)
+    return None
+def jira_key(*texts):  # legacy name used in a few places; resolves against current config
+    return tracker_key(cfg(), *texts)
+
+def extract_json(text):
+    text = text.strip()
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    if m: text = m.group(1)
+    start = text.find("{")
+    if start < 0: raise ValueError("no JSON object in output")
+    try: return json.loads(text[start:])
+    except json.JSONDecodeError: pass
+    dec = json.JSONDecoder()
+    while start >= 0:
+        try:
+            obj, _ = dec.raw_decode(text, start)   # string-aware: braces inside strings or regexes do not confuse it
+            if isinstance(obj, dict): return obj
+        except json.JSONDecodeError: pass
+        start = text.find("{", start + 1)
+    raise ValueError("no parseable JSON object in output")
+
+TIERS = ["low", "medium", "high"]
+def model_for(c, role, complexity="medium", rounds=0):
+    """role: planner|worker|reviewer. Workers escalate one tier per rework round."""
+    m = c.get("models", {})
+    if role == "planner": return m.get("planner", "opus")
+    if role == "worker":
+        idx = min(TIERS.index(complexity if complexity in TIERS else "medium") + rounds, 2)
+        return m.get(f"worker_{TIERS[idx]}", {"low": "haiku", "medium": "sonnet", "high": "opus"}[TIERS[idx]])
+    if role == "reviewer":
+        return m.get("reviewer_high", "opus") if complexity == "high" else m.get("reviewer", "sonnet")
+    if role == "tech_lead": return m.get("tech_lead", m.get("planner", "opus"))
+    return m.get("default", "sonnet")
+
+def reviewer_model(c, worker_model):
+    """The tech lead reviewing a round is always a different model from the worker, one tier up.
+    Returns (model, forced_high): opus work has no tier above, so it is reviewed by the medium model and forced to human review."""
+    m = c.get("models", {})
+    tiers = [m.get("worker_low", "haiku"), m.get("worker_medium", "sonnet"), m.get("worker_high", "opus")]
+    if worker_model == tiers[0]: return tiers[1], False
+    if worker_model == tiers[1]: return tiers[2], False
+    return (tiers[1] if tiers[1] != worker_model else tiers[0]), True
+
+def claude_cmd(c, prompt_file, settings, allowed, max_turns, model=None, extra=()):
+    cmd = ["claude", "-p", "--output-format", "json", "--max-turns", str(max_turns),
+           "--permission-mode", "acceptEdits", "--settings", str(settings),
+           "--allowedTools", ",".join(allowed),
+           "--append-system-prompt", Path(prompt_file).read_text()]
+    if model: cmd += ["--model", model]
+    cmd += list(extra)
+    return cmd
+
+def cross_repo(c):
+    """(--add-dir flags, a note for the prompt) so refiner, tech lead and planner can read every mapped repo, not just the one they run in. Workers never get this."""
+    rs = repos(c)
+    flags = []
+    for pth in rs.values(): flags += ["--add-dir", pth]
+    note = "REPOS READABLE FROM HERE (read-only; cite paths): " + "; ".join(f"{n} = {pth}" for n, pth in rs.items())
+    return flags, note
+
+LEDGER = ROOT / "finance" / "ledger.jsonl"
+def ledger_record(role, model, ref, stdout):
+    """Append tokens + notional cost from a claude -p JSON result. Silent on parse failure."""
+    try:
+        j = json.loads(stdout); u = j.get("usage", {}) or {}
+        row = {"t": now(), "role": role, "model": model or "", "ref": ref,
+               "cost_usd": j.get("total_cost_usd", 0.0), "in": u.get("input_tokens", 0), "out": u.get("output_tokens", 0),
+               "cache_read": u.get("cache_read_input_tokens", 0), "turns": j.get("num_turns", 0), "ms": j.get("duration_ms", 0)}
+        LEDGER.parent.mkdir(exist_ok=True)
+        with open(LEDGER, "a") as f: f.write(json.dumps(row) + "\n")
+    except Exception: pass
+
+def ledger_rows():
+    if not LEDGER.exists(): return []
+    return [json.loads(l) for l in LEDGER.read_text().splitlines() if l.strip()]
+
+SECRET_ENV = re.compile(r"(_API_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_PRIVATE_KEY)$|^(AWS_|GH_TOKEN|GITHUB_TOKEN|NPM_TOKEN|OPENAI|ANTHROPIC_API)")
+def account_dir(c):
+    """Claude Code config directory forge's agents sign in with: forge.json claude_home, else <forge>/account.
+    Separate from ~/.claude on purpose: forge keeps its own login, whichever account you use in your own shell or editor.
+    Nothing of forge's lives in it (tasks, plans, logs are forge's own files), so switching the login changes whose quota is used and nothing else."""
+    d = Path(os.path.expanduser(c.get("claude_home") or str(ROOT / "account")))
+    d.mkdir(parents=True, exist_ok=True)
+    try: os.chmod(d, 0o700)
+    except Exception: pass
+    return d
+
+def account_status(c):
+    """(logged_in, detail) for forge's own login."""
+    env = dict(os.environ); env["CLAUDE_CONFIG_DIR"] = str(account_dir(c))
+    for k in list(env):
+        if SECRET_ENV.search(k): env.pop(k)   # an API key or token in your shell must not mask the forge login
+    r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, env=env)
+    try: j = json.loads(r.stdout)
+    except Exception: return False, (r.stderr or r.stdout).strip()[-200:]
+    if not j.get("loggedIn"): return False, f"no login in {j.get('configDirectory')}"
+    t = subprocess.run(["claude", "auth", "status", "--text"], capture_output=True, text=True, env=env).stdout
+    who = {k.strip(): v.strip() for k, v in (l.split(":", 1) for l in t.splitlines() if ":" in l)}
+    return True, f"{who.get('Email', '?')} ({who.get('Login method', j.get('authMethod', '?'))}, {who.get('Organization', '?')}); config {j.get('configDirectory')}"
+
+def agent_env(c):
+    """Environment for worker and reviewer processes: your shell minus anything that looks like a credential, plus forge's own Claude login.
+    A paid-vendor key must never reach an agent; the owner runs live tests. Extra names via forge.json strip_env; keep_env whitelists."""
+    keep = set(c.get("keep_env", [])); extra = set(c.get("strip_env", []))
+    env = {k: v for k, v in os.environ.items() if k in keep or not (SECRET_ENV.search(k) or k in extra)}
+    env["CLAUDE_CONFIG_DIR"] = str(account_dir(c))
+    return sdk_env(env)
+
+def cmd_login(args):
+    """forge login [--email ADDR]: sign forge in to the Claude account its agents should use. Interactive; opens the browser like claude does."""
+    c = cfg(); env = agent_env(c)
+    ok, detail = account_status(c)
+    if ok and "--force" not in args: print(f"forge is already signed in: {detail}\nforge logout first to switch accounts, or forge login --force"); return
+    cmd = ["claude", "auth", "login", "--claudeai"] + (["--email", args[args.index("--email") + 1]] if "--email" in args else [])
+    print(f"signing forge in (config {account_dir(c)}); your own claude login is untouched", flush=True)
+    r = subprocess.run(cmd, env=env)
+    ok, detail = account_status(c)
+    print(("ok   " if ok else "FAIL ") + detail)
+    if not ok: die("not signed in; run forge login again")
+
+def cmd_logout(args):
+    """forge logout: sign forge out of its Claude account (your own login is untouched)."""
+    c = cfg(); subprocess.run(["claude", "auth", "logout"], env=agent_env(c)); print("forge signed out; forge login to sign in again")
+
+def cmd_version(args):
+    """forge version: installed version, and the version the running loop started with."""
+    print(f"forge v{VERSION} installed")
+    lv = ROOT / "logs" / "loop.version"
+    if lv.exists():
+        v, pid, t = lv.read_text().split()
+        print(f"loop: v{v} started {t} (pid {pid}){'' if pid_alive(int(pid)) else ' — not running'}" + ("" if v == VERSION else "  <- older than installed: restart forge loop"))
+    else: print("loop: never started with this install")
+
+def cmd_whoami(args):
+    """forge whoami: which Claude login forge's agents use right now."""
+    c = cfg(); ok, detail = account_status(c)
+    print(("forge agents: signed in, " if ok else "forge agents: NOT signed in, ") + detail)
+    if not ok: print("fix: forge login")
+
+def allowed_for_worker(c):
+    base = ["Read", "Edit", "Write", "MultiEdit", "Glob", "Grep", "LS", "TodoWrite"]
+    return base + [f"Bash({p})" for p in c["allowed_bash"]]
+
+def allowed_for_reviewer(c, test_cmd=None, lint_cmd=None):
+    allow = ["Read", "Glob", "Grep", "LS"]
+    for cmdline in (test_cmd or c.get("test_cmd"), lint_cmd or c.get("lint_cmd")):
+        if cmdline: allow.append(f"Bash({cmdline.split()[0]}:*)")
+    return allow
+
+def slack(c, text):
+    if not c.get("slack_webhook"): return
+    data = json.dumps({"text": text}).encode()
+    req = urllib.request.Request(c["slack_webhook"], data=data, headers={"Content-Type": "application/json"})
+    try: urllib.request.urlopen(req, timeout=10)
+    except Exception as e: print(f"slack post failed: {e}", file=sys.stderr)
+
+# ---------------------------------------------------------------- jira (via your CLI, as you)
+
+def identity(c):
+    """forge.json -> identity {name, email, signingkey?, gpgsign?}. Empty dict = use whatever git resolves."""
+    return {k: v for k, v in (c.get("identity") or {}).items() if not k.startswith("_") and v}
+
+def git_id_flags(c):
+    """-c flags that pin author/committer/signing for every git commit forge makes."""
+    i = identity(c); f = []
+    if i.get("name"): f += ["-c", f"user.name={i['name']}"]
+    if i.get("email"): f += ["-c", f"user.email={i['email']}"]
+    if i.get("signingkey"): f += ["-c", f"user.signingkey={i['signingkey']}"]
+    if "gpgsign" in i: f += ["-c", f"commit.gpgsign={'true' if i['gpgsign'] else 'false'}"]
+    if i.get("gpg_format"): f += ["-c", f"gpg.format={i['gpg_format']}"]
+    return f
+
+def git_env(c):
+    """SSH key / host alias for pushes, from identity.ssh_key or identity.ssh_command."""
+    i = identity(c); env = dict(os.environ)
+    if i.get("ssh_command"): env["GIT_SSH_COMMAND"] = i["ssh_command"]
+    elif i.get("ssh_key"): env["GIT_SSH_COMMAND"] = f"ssh -i {shlex.quote(os.path.expanduser(i['ssh_key']))} -o IdentitiesOnly=yes"
+    return env
+
+def check_identity(c, repo):
+    """Compare what git would use in this repo with forge.json identity. Returns (ok, resolved_name, resolved_email)."""
+    i = identity(c)
+    rn = sh(["git", "config", "user.name"], cwd=repo, check=False).stdout.strip()
+    re_ = sh(["git", "config", "user.email"], cwd=repo, check=False).stdout.strip()
+    ok = (not i.get("email") or i["email"].lower() == re_.lower()) and (not i.get("name") or i["name"] == rn)
+    return ok, rn, re_
+
+def redact(c, text):
+    """Apply forge.json -> redact {term: replacement} to anything leaving the machine (tracker, CLAUDE.md). Case-insensitive, whole words."""
+    terms = {k: v for k, v in (c.get("redact") or {}).items() if not k.startswith("_")}
+    for term in sorted(terms, key=len, reverse=True):   # longest first so "For X" wins over "X"
+        text = re.sub(r"(?i)\b" + re.escape(term) + r"\b", terms[term], text)
+    return text
+
+def jira_cmd(c, name, **kw):
+    """Render a tracker command template (kind-specific). Returns None if not configured. Text fields are redacted."""
+    tpl = tracker(c).get(name)
+    if not tpl: return None
+    kw = {k: (redact(c, str(v)) if k in ("text", "title") else v) for k, v in kw.items()}
+    cmd = tpl.format(**{k: shlex.quote(str(v)) for k, v in kw.items()})
+    t = tracker(c)
+    if t.get("kind") == "github":
+        if not t.get("repo"): die("tracker.repo (owner/name) must be set for GitHub: gh needs a repo and forge does not run inside one")
+        cmd += f" -R {shlex.quote(t['repo'])}"
+        if t.get("gh_user"): cmd = f"gh auth switch --user {shlex.quote(t['gh_user'])} >/dev/null 2>&1; " + cmd
+    return cmd
+
+def gh_prefix(c):
+    t = tracker(c)
+    return f"gh auth switch --user {shlex.quote(t['gh_user'])} >/dev/null 2>&1; " if t.get("gh_user") else ""
+
+def ensure_labels(c):
+    """gh refuses unknown labels on create/edit, so make forge's labels exist in the issues repo."""
+    t = tracker(c)
+    if t.get("kind") != "github": return
+    for lab in ["forge"] + list(t.get("states", {}).values()):
+        sh(gh_prefix(c) + f"gh label create {shlex.quote(lab)} --force -R {shlex.quote(t['repo'])}", check=False)
+
+def tracker_create(c, title, body):
+    """Create an issue; returns its key or None. GitHub: parses the issue URL gh prints."""
+    cmd = jira_cmd(c, "create", title=title, text=body)
+    if not cmd: return None
+    r = sh(cmd, check=False)
+    if r.returncode != 0: print(f"tracker create failed: {r.stderr.strip()[:200]}"); return None
+    m = re.search(r"/issues/(\d+)", r.stdout) or re.search(tracker(c)["key_pattern"], r.stdout)
+    return m.group(1) if m and m.groups() else (m.group(0) if m else None)
+
+def commit_prefix(c, key, repo_path):
+    """'#41' inside the issues repo, 'owner/name#41' in any other repo so GitHub still links the commit."""
+    t = tracker(c); pre = t["commit_prefix"].format(key=key)
+    if t.get("kind") == "github" and t.get("repo"):
+        r = sh(["git", "remote", "get-url", "origin"], cwd=repo_path, check=False)
+        url = (r.stdout or "").strip().lower()
+        if t["repo"].lower() not in url.replace(".git", ""): pre = f"{t['repo']}#{key}"
+    return pre
+
+def jira_read(c, key):
+    cmd = jira_cmd(c, "view", key=key)
+    if not cmd: die(f"no ticket file tickets/{key}.md and tracker.kind is '{tracker(c).get('kind','none')}' with no view command")
+    r = sh(cmd, check=False)
+    if r.returncode != 0: die(f"tracker read failed: {r.stderr.strip()[:300]}")
+    out = r.stdout
+    if tracker(c).get("kind") == "github" and " --comments" in cmd:
+        # non-TTY `gh issue view --comments` prints only the comments; the title and body come from a second call
+        r2 = sh(cmd.replace(" --comments", ""), check=False)
+        if r2.returncode != 0: die(f"tracker read failed: {r2.stderr.strip()[:300]}")
+        out = r2.stdout.rstrip() + "\n\n## Comments\n" + out
+    return out
+
+def jira_comment(c, key, text):
+    cmd = jira_cmd(c, "comment", key=key, text=text)
+    if not cmd: return
+    r = sh(cmd, check=False)
+    print(f"tracker: comment on {key}" + ("" if r.returncode == 0 else f" FAILED: {r.stderr.strip()[:200]}"))
+
+def jira_transition(c, key, state_name):
+    state = tracker(c).get("states", {}).get(state_name)
+    cmd = jira_cmd(c, "transition", key=key, state=state) if state else None
+    if not cmd: return
+    r = sh(cmd, check=False)
+    print(f"tracker: {key} -> {state}" + ("" if r.returncode == 0 else f" FAILED: {r.stderr.strip()[:200]}"))
+
+def ticket_path(key): return ROOT / "tickets" / f"{key}.md"
+
+def ticket_close(c, key, superseded_by=None, reason=""):
+    """All subtasks approved and merged -> pull main, run the repo's test command there, close the issue with the PR list.
+    --superseded-by NEW: owner steps still open are withdrawn (their acceptance criterion moved to NEW); worker subtasks must still be approved."""
+    tasks = [(t, s, st) for t, s, st in all_tasks() if s.get("jira") == key]
+    if not tasks: die(f"no tasks for {key}")
+    if superseded_by:
+        for t, s, st in tasks:
+            if st.get("state") not in ("approved", "withdrawn") and s.get("owner") and not st.get("pr_url"):
+                round_log(t, round=0, outcome="withdrawn", superseded_by=superseded_by, reason=reason)
+                set_state(t, "withdrawn", superseded_by=superseded_by, withdrawn=now()); st["state"] = "withdrawn"
+                print(f"{t}: withdrawn, acceptance moved to {superseded_by}")
+    open_ = [t for t, s, st in tasks if st.get("state") not in ("approved", "withdrawn")]
+    if open_: die(f"not all subtasks approved: {', '.join(open_)}" + ("" if superseded_by else "; an owner step whose criterion is withdrawn closes with forge ticket close KEY --superseded-by NEW --reason \"...\""))
+    for t, s, st in tasks:   # PRs merged by hand on GitHub: ask gh rather than trusting the flag
+        if st.get("pr_url") and not st.get("merged"):
+            r = sh(gh_prefix(c) + f"gh pr view {shlex.quote(st['pr_url'])} --json state -q .state", check=False)
+            if r.stdout.strip() == "MERGED": set_state(t, st["state"], merged=True); st["merged"] = True
+    unmerged = [t for t, s, st in tasks if st.get("pr_url") and not st.get("merged")]
+    if unmerged: die(f"PRs not merged yet: {', '.join(unmerged)}")
+    rname, rpath, test_cmd, _ = repo_for(c, tasks[0][1])
+    cur = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=rpath, check=False).stdout.strip()
+    if cur != c["base_branch"]: die(f"{rpath} is on {cur}, not {c['base_branch']}; switch first")
+    sh(["git", "pull", "-q", "--ff-only"], cwd=rpath, check=False, env=git_env(c))
+    print(f"running {test_cmd} on {rname} {c['base_branch']}…", flush=True)
+    status, tail = run_gate(test_cmd, rpath)
+    if status != "green": print(tail[-2000:]); die(f"{c['base_branch']} is {status}; not closing {key}")
+    prs = [st.get("pr_url") for t, s, st in tasks if st.get("pr_url")]
+    if c.get("audit", True):
+        print("writing the audit log into the repo…", flush=True)
+        apr = write_audit(c, key, rpath)
+        if apr: prs.append(apr)
+    wd = [t for t, s, st in tasks if st.get("state") == "withdrawn"]
+    body = f"{len(tasks) - len(wd)} subtask(s) merged; {test_cmd} green on {c['base_branch']}.\n" + "\n".join(f"- {p}" for p in prs)
+    if wd: body += f"\n\nWithdrawn, superseded by #{superseded_by or (load(wd[0], 'state.json') or {}).get('superseded_by')}: " + ", ".join(wd) + (f"\nReason: {reason}" if reason else "")
+    if tracker(c).get("kind") == "github":
+        r = sh(gh_prefix(c) + f"gh issue close {shlex.quote(key)} -R {shlex.quote(tracker(c)['repo'])} --comment {shlex.quote(redact(c, body))}", check=False)
+        print((r.stdout or r.stderr).strip())
+    else:
+        jira_comment(c, key, body); jira_transition(c, key, "done") if tracker(c).get("states", {}).get("done") else None
+    (ROOT / "tickets" / f"{key}.closed").write_text(now()); print(f"closed {key}")
+
+def cmd_ticket(args):
+    if not args: die("usage: forge ticket COS-123 | close KEY")
+    c = cfg()
+    if args[0] == "close":
+        sup = args[args.index("--superseded-by") + 1] if "--superseded-by" in args else None
+        rsn = args[args.index("--reason") + 1] if "--reason" in args else ""
+        if sup and not rsn: die("--superseded-by needs --reason \"why the criterion was withdrawn\" (it goes in the audit)")
+        ticket_close(c, args[1], sup, rsn); return
+    key = args[0]
+    txt = jira_read(c, key)
+    ticket_path(key).parent.mkdir(exist_ok=True)
+    ticket_path(key).write_text(f"# {key}\n\n{txt}")
+    print(f"-> {ticket_path(key)}  ({len(txt.splitlines())} lines)")
+    return txt
+
+# ---------------------------------------------------------------- refine
+
+def refine_path(c, key, name): return plans_dir(c) / key / name
+
+def render_refine_md(key, r):
+    L = [f"# {key} — refinement", "", f"verdict: {r['verdict']}   accepted: {r.get('_accepted', False)}", "", r.get("summary", ""), ""]
+    if r.get("questions"):
+        L += ["## Questions"] + [f"{q['n']}. [{q['to']}] {q['question']}  — _{q.get('why','')}_" for q in r["questions"]] + [""]
+    if r.get("unresolved_references"): L += ["## References that do not resolve"] + [f"- {x}" for x in r["unresolved_references"]] + [""]
+    if r.get("suggested_split"): L += ["## Suggested split"] + [f"- {x}" for x in r["suggested_split"]] + [""]
+    return "\n".join(L)
+
+def load_refine(c, key):
+    p = refine_path(c, key, "refine.json")
+    return json.loads(p.read_text()) if p.exists() else None
+
+def save_refine(c, key, r):
+    d = plans_dir(c) / key; d.mkdir(exist_ok=True)
+    (d / "refine.json").write_text(json.dumps(r, indent=2)); (d / "refine.md").write_text(render_refine_md(key, r))
+
+def cmd_refine(args):
+    if not args: die("usage: forge refine COS-123 | show KEY | post KEY | accept KEY | answer KEY [--auto]")
+    c = cfg(); sub = args[0]
+    if sub == "answer":
+        if len(args) >= 4 and args[2].isdigit(): direct_answer(c, args[1], int(args[2]), args[3], "refine"); return
+        refine_answer(c, args[1], "--auto" in args); return
+    if sub in ("show", "post", "accept"):
+        key = args[1]; r = load_refine(c, key) or die(f"no refinement for {key}; run `forge refine {key}` first")
+        if sub == "show": print(render_refine_md(key, r)); return
+        if sub == "accept":
+            r["_accepted"] = True; r["_accepted_at"] = now(); save_refine(c, key, r); print(f"{key} accepted as READY"); return
+        if sub == "post":
+            qs = [q for q in r.get("questions", []) if q["to"] != "tech-lead" and not q.get("_posted")]
+            if not qs: print("no reporter/platform questions left to post"); return
+            body = "Refinement questions before this is picked up:\n" + "\n".join(f"{q['n']}. ({q['to']}) {q['question']}" for q in qs)
+            print(body); 
+            if input("\nPost this comment to Jira? [y/N] ").strip().lower() != "y": print("not posted"); return
+            jira_comment(c, key, body)
+            for q in qs: q["_posted"] = now()
+            save_refine(c, key, r); return
+    key = sub
+    tp = ticket_path(key)
+    ticket = tp.read_text() if tp.exists() else cmd_ticket([key])
+    read_cmd = tracker(c).get("view", "")
+    allowed = ["Read", "Glob", "Grep", "LS"] + ([f"Bash({read_cmd.split()[0]}:*)"] if read_cmd else [])
+    model = (c.get("models") or {}).get("refiner", "sonnet")
+    xflags, xnote = cross_repo(c)
+    cmd = claude_cmd(c, PROMPTS / "refiner.md", REVIEWER_SETTINGS, allowed, 40, model, extra=xflags)
+    body = f"TICKET {key}:\n\n{ticket}\n\n{xnote}\n\nTracker read command for linked issues: {read_cmd or '(none)'}"
+    m = re.search(r"^repo:\s*([\w-]+)", ticket, re.M)
+    _, rpath, _, _ = repo_for(c, m.group(1) if m else None)
+    print(f"refining with {model} in {rpath}…", flush=True)
+    res = subprocess.run(cmd, input=body, cwd=rpath, text=True, capture_output=True, env=agent_env(c))
+    (LOGS / f"refine-{key}.log").write_text(res.stdout + "\n--- stderr ---\n" + res.stderr)
+    if res.returncode != 0: die(f"refiner failed, see logs/refine-{key}.log")
+    ledger_record("refiner", model, key, res.stdout)
+    r = extract_json(json.loads(res.stdout).get("result", ""))
+    prev = load_refine(c, key) or {}
+    r["_accepted"] = False; r["_runs"] = prev.get("_runs", 0) + 1; r["_updated"] = now()
+    save_refine(c, key, r)
+    print(render_refine_md(key, r))
+    nxt = f"forge refine answer {key}   (tech lead drafts, you confirm)" if r.get("questions") else f"forge refine accept {key}"
+    print(f"→ {nxt}   |   forge refine accept {key}   |   forge next {key} does the whole chain")
+
+# ---------------------------------------------------------------- tech lead: answers to refiner / planner questions
+
+def decisions_context(c, ticket_text, rpath):
+    """Decisions document (from the discovery project named in the ticket, or forge.json decisions_doc) and the in-repo P register."""
+    parts = []
+    m = re.search(r"^project:\s*([\w-]+)", ticket_text or "", re.M)
+    doc = None
+    if m:
+        sp = plans_dir(c) / "_discovery" / m.group(1) / "status.json"
+        if sp.exists(): doc = json.loads(sp.read_text()).get("doc")
+    doc = doc or c.get("decisions_doc")
+    if doc and Path(os.path.expanduser(doc)).exists():
+        parts.append(f"DECISIONS DOCUMENT ({doc}):\n" + Path(os.path.expanduser(doc)).read_text()[:60000])
+    reg = Path(rpath) / "docs" / "decisions" / "p-items.md"
+    if reg.exists(): parts.append("P-ITEM REGISTER (docs/decisions/p-items.md):\n" + reg.read_text()[:20000])
+    return "\n\n".join(parts)
+
+def techlead_answers(c, key, ticket_text, questions, rpath):
+    model = model_for(c, "tech_lead")
+    allowed = ["Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch"]
+    xflags, xnote = cross_repo(c)
+    cmd = claude_cmd(c, PROMPTS / "tech-lead.md", REVIEWER_SETTINGS, allowed, 40, model, extra=xflags)
+    body = (f"MODE ANSWER\n\nTICKET {key}:\n{ticket_text}\n\n{xnote}\n\nQUESTIONS:\n" + json.dumps(questions, indent=2) +
+            "\n\n" + decisions_context(c, ticket_text, rpath))
+    print(f"tech lead ({model}) drafting answers to {len(questions)} question(s)…", flush=True)
+    r = subprocess.run(cmd, input=body, cwd=rpath, text=True, capture_output=True, env=agent_env(c))
+    (LOGS / f"techlead-{key}.log").write_text(r.stdout + "\n--- stderr ---\n" + r.stderr)
+    if r.returncode != 0: die(f"tech lead failed, see logs/techlead-{key}.log")
+    ledger_record("tech-lead", model, key, r.stdout)
+    out = extract_json(json.loads(r.stdout).get("result", ""))
+    return {p["n"]: p for p in out.get("proposals", [])}
+
+def answer_walkthrough(questions, proposals, auto=False):
+    """One question at a time. Enter/a accept, text replaces, h leaves it for the human, q stops. Returns (answers, left)."""
+    answers, left = [], []
+    for i, q in enumerate(questions, 1):
+        n = q.get("n", i); p = proposals.get(n) or {}
+        qtext = q.get("question") or q
+        print(f"\n[{i}/{len(questions)}] ({q.get('to', '?')}) {qtext}")
+        if not p: print("  tech lead: no proposal"); left.append((n, qtext)); continue
+        print(f"  proposed: {p.get('answer')}\n  evidence: {p.get('evidence')}   confidence: {p.get('confidence')}")
+        if p.get("needs_human"):
+            print(f"  NEEDS YOU: {p.get('human_decision') or 'decision the tech lead cannot source'}")
+        if auto and not p.get("needs_human") and p.get("confidence") in ("high", "medium"):
+            answers.append((n, p["answer"])); print("  accepted (auto)"); continue
+        a = input("  [Enter/a accept | type an answer | h leave for me | q stop] > ").strip()
+        if a == "q": break
+        if a == "h": left.append((n, qtext)); continue
+        if a in ("", "a"):
+            if p.get("needs_human"): print("  that one needs an answer from you; type it or h"); a = input("  > ").strip()
+            else: answers.append((n, p["answer"])); continue
+        if a in ("", "h"): left.append((n, qtext)); continue
+        answers.append((n, a))
+    return answers, left
+
+def post_answers(c, key, answers, heading):
+    if not answers: return
+    body = heading + "\n" + "\n".join(f"{n}. {a}" for n, a in answers)
+    jira_comment(c, key, body); print(f"posted {len(answers)} answer(s) on {key}")
+
+def print_left(key, left, props, kind):
+    """Questions the owner kept: show each in full with what the tech lead needs, and the exact way to answer it without re-running anyone."""
+    if not left: return
+    print(f"\nleft for you ({len(left)}):")
+    for n, q in left:
+        p = props.get(n) or {}
+        print(f"  {n}. {q}")
+        if p.get("human_decision"): print(f"     needs: {p['human_decision']}")
+        if p.get("answer"): print(f"     tech lead's draft, if you agree with it: {p['answer'][:300]}")
+    print(f"answer one directly: forge {kind} answer {key} N \"your answer\"   (posts it and marks it answered; no agents run)")
+    print(f"re-run the tech lead on what is still open: forge {kind} answer {key}")
+
+def direct_answer(c, key, n, text, kind):
+    """Owner answers question N themselves; post it, mark it, no tech lead."""
+    if kind == "refine":
+        r = load_refine(c, key) or die(f"no refinement for {key}")
+        q = next((q for q in r.get("questions", []) if str(q.get("n")) == str(n)), None) or die(f"no question {n} in {key}'s refinement")
+        post_answers(c, key, [(n, text)], "Answer to refinement question (owner):")
+        q["_answered"] = now(); q["_owner_answer"] = text; save_refine(c, key, r)
+        open_ = [q["n"] for q in r.get("questions", []) if not q.get("_answered")]
+        print(f"{key}: question {n} answered; open: {open_ or 'none'}" + ("" if open_ else f"\nnext: forge refine {key} (re-reads the answers; expect READY) or forge refine accept {key}"))
+    else:
+        plan = read_plan(c, key); qs = plan.get("questions") or []
+        qs = [q if isinstance(q, dict) else {"n": i + 1, "to": "tech-lead", "question": str(q)} for i, q in enumerate(qs)]
+        q = next((q for q in qs if str(q.get("n")) == str(n)), None) or die(f"no question {n} in {key}'s plan")
+        post_answers(c, key, [(n, text)], "Answer to planner question (owner):")
+        plan["_owner_answers"] = plan.get("_owner_answers", []) + [{"n": n, "answer": text, "t": now()}]
+        plan["questions"] = [x for x in qs if str(x.get("n")) != str(n)]; write_plan(c, key, plan, Path(plan["_ticket"]))
+        print(f"{key}: planner question {n} answered; open: {[x['n'] for x in plan['questions']] or 'none'}" + ("" if plan["questions"] else f"\nnext: forge plan revise {key} so the planner reads the answers"))
+
+def refine_answer(c, key, auto=False):
+    r = load_refine(c, key) or die(f"no refinement for {key}; run `forge refine {key}` first")
+    qs = [q for q in r.get("questions", []) if not q.get("_answered")]
+    if not qs: print("no open refinement questions"); return True
+    tp = ticket_path(key); ticket = tp.read_text() if tp.exists() else cmd_ticket([key])
+    m = re.search(r"^repo:\s*([\w-]+)", ticket, re.M); _, rpath, _, _ = repo_for(c, m.group(1) if m else None)
+    props = techlead_answers(c, key, ticket, qs, rpath)
+    answers, left = answer_walkthrough(qs, props, auto)
+    post_answers(c, key, answers, "Answers to refinement questions (tech lead, confirmed by owner):")
+    done = {n for n, _ in answers}
+    for q in r.get("questions", []):
+        if q.get("n") in done: q["_answered"] = now()
+    save_refine(c, key, r)
+    print_left(key, left, props, "refine")
+    return not left
+
+def plan_answer(c, key, auto=False):
+    plan = read_plan(c, key); qs = plan.get("questions") or []
+    if not qs: print("no open planner questions"); return True
+    qs = [q if isinstance(q, dict) else {"n": i + 1, "to": "tech-lead", "question": str(q)} for i, q in enumerate(qs)]
+    ticket = Path(plan["_ticket"]).read_text(); rpath = repos(c).get(plan.get("_repo")) or c["repo"]
+    props = techlead_answers(c, key, ticket, qs, rpath)
+    answers, left = answer_walkthrough(qs, props, auto)
+    post_answers(c, key, answers, "Answers to planner questions (tech lead, confirmed by owner):")
+    if answers:
+        fb = "Answers to your questions:\n" + "\n".join(f"{n}. {a}" for n, a in answers)
+        plan = run_planner(c, ticket, plan, fb, repo=rpath); plan["_repo"] = read_plan(c, key).get("_repo")
+        d = write_plan(c, key, plan, Path(read_plan(c, key)["_ticket"])); _plan_report(key, plan, d)
+    print_left(key, left, props, "plan")
+    return not left
+
+def cmd_next(args):
+    """Advance one ticket from refine to an approvable plan, stopping only where a human must decide."""
+    if not args: die("usage: forge next KEY [--auto]")
+    c = cfg(); key = args[0]; auto = "--auto" in args
+    r0 = load_refine(c, key)
+    rnd = 0
+    for rnd in range(3):
+        if rnd == 0 and r0 and r0.get("_accepted"): print(f"{key} already accepted as READY; skipping refine"); break
+        cmd_refine([key])
+        r = load_refine(c, key)
+        if r.get("verdict") == "READY" and not [q for q in r.get("questions", []) if q["to"] != "tech-lead"]:
+            break
+        if not refine_answer(c, key, auto): print("stopping: a refinement question needs you"); return
+        cmd_ticket([key])
+    r = load_refine(c, key)
+    if r.get("verdict") != "READY":
+        qs = r.get("questions", [])
+        print(f"stopping: still NOT_READY after {rnd+1} round(s); {len(qs)} open question(s), all answered in comments" if all(q.get("_answered") for q in qs) else f"stopping: still NOT_READY after {rnd+1} round(s)")
+        print(f"next: forge refine show {key}   (what it still wants)")
+        print(f"      forge refine accept {key} && forge plan {key}   (the questions are answered or waivable: proceed)")
+        print(f"      edit the issue description to fold the answers in, then forge next {key}   (the refiner wants it in the description)")
+        return
+    r["_accepted"] = True; r["_accepted_at"] = now(); save_refine(c, key, r); print(f"{key} accepted as READY")
+    cmd_plan([key])
+    plan = read_plan(c, key)
+    if plan.get("questions"):
+        if not plan_answer(c, key, auto): print("stopping: a planner question needs you"); return
+        cmd_ticket([key])
+    print(f"\n→ read {plans_dir(c)/key/'plan.md'}, then: forge plan approve {key}")
+
+# ---------------------------------------------------------------- discover (product team)
+
+def disc_dir(c, project):
+    d = plans_dir(c) / "_discovery" / project; d.mkdir(parents=True, exist_ok=True); return d
+
+def run_role(c, role, prompt_file, body, model, cwd=None, ref=""):
+    cmd = claude_cmd(c, PROMPTS / prompt_file, REVIEWER_SETTINGS, ["Read", "Glob", "Grep", "LS"], 30, model)
+    print(f"  {role} ({model})…", flush=True)
+    r = subprocess.run(cmd, input=body, cwd=cwd or c["repo"], text=True, capture_output=True, env=agent_env(c))
+    (LOGS / f"discover-{role}-{datetime.now():%m%d-%H%M%S}.log").write_text(r.stdout + "\n--- stderr ---\n" + r.stderr)
+    if r.returncode != 0: die(f"{role} failed, see logs/")
+    ledger_record(role, model, ref, r.stdout)
+    return extract_json(json.loads(r.stdout).get("result", ""))
+
+def dmodel(c, role):
+    m = c.get("models", {})
+    return m.get(f"discover_{role}", {"product": "opus", "architect": "opus", "qa": "sonnet", "finance": "sonnet", "challenger": "sonnet"}[role])
+
+def g(d, k, default=""):
+    return d.get(k, default) if isinstance(d, dict) else default
+
+def render_backlog_md(b, arch, qa, fin, chal):
+    L = [f"# {g(b,'project')} — backlog", "", "## Outcomes"] + [f"- {o}" for o in g(b, "outcomes", [])] + [""]
+    L += ["## Build order", ", ".join(g(b, "order", [])), ""]
+    tests = {g(t, "story"): t for t in g(qa, "per_story", []) if isinstance(t, dict)}
+    for e in g(b, "epics", []):
+        L += [f"## {g(e,'id')} {g(e,'title')}  [{g(e,'repo')}]  ← {', '.join(g(e,'traces',[]))}", ""]
+        for st in g(b, "stories", []):
+            if g(st, "epic") != g(e, "id"): continue
+            flag = "" if g(st, "forgeable", True) else f"  **MANUAL**: {g(st,'manual_reason')}"
+            L += [f"### {g(st,'id')} {g(st,'title')}  [{g(st,'repo')}/{g(st,'complexity')}]{flag}", g(st, "description"), "",
+                  "acceptance:"] + [f"- {a}" for a in g(st, "acceptance", [])]
+            if g(st, "depends_on"): L += [f"depends on: {', '.join(g(st,'depends_on'))}"]
+            t = tests.get(g(st, "id"))
+            if t: L += ["tests:"] + [f"- ({g(x,'kind')}) {g(x,'what')} — {g(x,'asserts')}" for x in g(t, "tests", [])]
+            L += [""]
+    orphans = [st for st in g(b, "stories", []) if g(st, "epic") not in {g(e, "id") for e in g(b, "epics", [])}]
+    if orphans: L += ["## Stories without an epic"] + [f"- {g(st,'id')} {g(st,'title')}" for st in orphans] + [""]
+    if g(b, "deferred"): L += ["## Deferred (blocked by open questions)"] + [f"- {g(d,'would_be')}  ← {', '.join(g(d,'blocked_by',[]))}" for d in g(b, "deferred", [])] + [""]
+    if arch:
+        L += ["## Architecture"] + [f"- **{g(a,'id')} {g(a,'title')}**: {g(a,'decision')}" for a in g(arch, "adrs", [])] + [""]
+        L += ["### Invariants"] + [f"- {g(i,'id')} ({g(i,'enforced_by')}, {g(i,'repo')}): {g(i,'rule')}" for i in g(arch, "invariants", [])] + [""]
+        if g(arch, "risks"): L += ["### Risks"] + [f"- {g(r,'risk')} → {g(r,'mitigation')}" for r in g(arch, "risks", [])] + [""]
+    if g(qa, "gaps"): L += ["## Untestable acceptance criteria"] + [f"- {x}" for x in g(qa, "gaps", [])] + [""]
+    if fin: L += ["## Finance", g(fin, "report_md"), ""]
+    if chal:
+        L += [f"## Challenger: {g(chal,'verdict')}"] + [f"- [{g(f,'severity')}] {g(f,'target')}: {g(f,'issue')} → {g(f,'fix') or '(no fix given)'}" for f in g(chal, "findings", [])]
+        if g(chal, "missing_stories"): L += ["missing stories:"] + [f"- {g(m,'title')} — {g(m,'why')}" for m in g(chal, "missing_stories", [])]
+        if g(chal, "questions_for_human"): L += ["questions for you:"] + [f"- {q}" for q in g(chal, "questions_for_human", [])]
+    return "\n".join(str(x) for x in L)
+
+def cmd_discover_answer(c, project, doc_override=None):
+    d = disc_dir(c, project)
+    qp = d / "questions.json"; sp = d / "status.json"
+    if not qp.exists(): die(f"no questions for {project}; run forge discover first")
+    q = json.loads(qp.read_text())
+    doc_path = Path(doc_override) if doc_override else (Path(json.loads(sp.read_text()).get("doc", "")) if sp.exists() else None)
+    if not doc_path or not doc_path.exists(): die("cannot find the decisions document for this discovery; pass it: forge discover answer NAME --doc decisions/trainer.md")
+    doc = doc_path.read_text()
+    existing = {}
+    m = re.search(r"^## ANSWERS\s*$(.*)", doc, re.M | re.S)
+    if m:
+        for line in m.group(1).splitlines():
+            mm = re.match(r"^\s*[-*]?\s*([A-Za-z0-9_-]+)\s*:\s*(.+)$", line)
+            if mm: existing[mm.group(1)] = mm.group(2).strip()
+    blocking = q.get("blocking", [])
+    print(f"{len(blocking)} blocking question(s). For each: a number picks an option, 'd' defers (backlog uses the stated default), 's' skips for now, or type an answer.\n")
+    answers = dict(existing)
+    for i, x in enumerate(blocking, 1):
+        qid = x.get("id", f"Q-new-{i}")
+        print(f"[{i}/{len(blocking)}] {qid}: {x['question']}")
+        if x.get("blocks"): print(f"      blocks: {', '.join(x['blocks'])}")
+        opts = x.get("options_in_doc") or []
+        for n, o in enumerate(opts, 1): print(f"      {n}) {o}")
+        if x.get("default_if_deferred"): print(f"      d) defer -> {x['default_if_deferred']}")
+        if qid in existing: print(f"      current answer: {existing[qid]}  (enter to keep)")
+        try: a = input("    > ").strip()
+        except EOFError: print(); break
+        if a == "" and qid in existing: continue
+        if a == "" or a.lower() == "s": print("      skipped\n"); continue
+        if a.lower() == "d": answers[qid] = f"DEFERRED — assume: {x.get('default_if_deferred', 'cannot proceed')}"
+        elif a.isdigit() and 1 <= int(a) <= len(opts): answers[qid] = opts[int(a) - 1]
+        else: answers[qid] = a
+        print(f"      -> {answers[qid]}\n")
+    if not answers: print("nothing recorded"); return
+    block = "## ANSWERS\n\nAnswered via forge discover answer; later lines override earlier ones.\n\n" + "\n".join(f"- {k}: {v}" for k, v in answers.items()) + "\n"
+    doc = re.sub(r"^## ANSWERS\s*$.*", block, doc, flags=re.M | re.S) if m else doc.rstrip() + "\n\n" + block
+    doc_path.write_text(doc)
+    unanswered = [x.get("id") for x in blocking if x.get("id") not in answers]
+    print(f"wrote {len(answers)} answer(s) to {doc_path}")
+    lead = ("still open: " + ", ".join(unanswered) + "  — answer or defer them, then: ") if unanswered else "all blocking questions answered — now: "
+    print(lead + f"forge discover {doc_path} --project {project}")
+
+def cmd_discover(args):
+    if not args: die("usage: forge discover <decisions.md> --project NAME [--force]  |  forge discover answer NAME")
+    if args[0] == "answer":
+        if len(args) < 2: die("usage: forge discover answer NAME [--doc decisions.md]")
+        cmd_discover_answer(cfg(), args[1], args[args.index("--doc") + 1] if "--doc" in args else None); return
+    c = cfg(); doc_path = Path(args[0]); doc = doc_path.read_text()
+    project = args[args.index("--project") + 1] if "--project" in args else re.sub(r"[^a-z0-9]+", "-", doc_path.stem.lower()).strip("-")
+    d = disc_dir(c, project); cwd = next(iter(repos(c).values()))
+    # pass 1: questions
+    q = run_role(c, "product", "discover-product.md", f"MODE = QUESTIONS\n\nDOCUMENT:\n{doc}", dmodel(c, "product"), cwd, project)
+    (d / "questions.json").write_text(json.dumps(q, indent=2))
+    qmd = ["# Blocking decisions"] + [f"- **{x['id']}** {x['question']}\n  blocks: {', '.join(x.get('blocks', []))}\n  options in doc: {' | '.join(x.get('options_in_doc', [])) or '—'}" for x in q.get("blocking", [])]
+    qmd += ["", "# Can wait"] + [f"- {x['id']} {x['question']} — {x.get('why_later','')}" for x in q.get("non_blocking", [])]
+    (d / "questions.md").write_text("\n".join(qmd))
+    if not (d / "status.json").exists() or json.loads((d / "status.json").read_text()).get("status") != "approved":
+        (d / "status.json").write_text(json.dumps({"project": project, "status": "questions", "doc": str(doc_path.resolve()), "updated": now()}))
+    if q.get("blocking") and "--force" not in args:
+        print("\n".join(qmd)); print(f"\n{len(q['blocking'])} blocking. Answer them with:  forge discover answer {project}   (or edit {doc_path} by hand), then re-run this command.")
+        return
+    # pass 2: backlog, architecture, tests, finance, challenger
+    print("no blocking questions — building the backlog")
+    b = run_role(c, "product", "discover-product.md", f"MODE = BACKLOG\n\nDOCUMENT:\n{doc}", dmodel(c, "product"), cwd, project)
+    arch = run_role(c, "architect", "discover-architect.md", f"DOCUMENT:\n{doc}\n\nBACKLOG:\n{json.dumps(b, indent=1)}", dmodel(c, "architect"), cwd, project)
+    qa = run_role(c, "qa", "discover-qa.md", f"DOCUMENT:\n{doc}\n\nBACKLOG:\n{json.dumps(b, indent=1)}\n\nARCHITECTURE:\n{json.dumps(arch, indent=1)}", dmodel(c, "qa"), cwd, project)
+    fin = run_role(c, "finance", "discover-finance.md", f"DOCUMENT:\n{doc}\n\nBACKLOG:\n{json.dumps(b, indent=1)}\n\nAGENT LEDGER:\n{json.dumps(ledger_rows()[-200:])}", dmodel(c, "finance"), cwd, project)
+    chal = run_role(c, "challenger", "discover-challenger.md", f"DOCUMENT:\n{doc}\n\nBACKLOG:\n{json.dumps(b, indent=1)}\n\nARCHITECTURE:\n{json.dumps(arch, indent=1)}\n\nTESTS:\n{json.dumps(qa, indent=1)}\n\nFINANCE:\n{json.dumps(fin, indent=1)}", dmodel(c, "challenger"), cwd, project)
+    for name, obj in (("backlog", b), ("architecture", arch), ("tests", qa), ("finance", fin), ("challenger", chal)):
+        (d / f"{name}.json").write_text(json.dumps(obj, indent=2))
+    for repo_name, text in (arch.get("claude_md") or {}).items(): (d / f"CLAUDE.{repo_name}.md").write_text(text)
+    (d / "backlog.md").write_text(render_backlog_md(b, arch, qa, fin, chal))
+    (d / "status.json").write_text(json.dumps({"project": project, "status": "draft", "doc": str(doc_path.resolve()), "updated": now()}))
+    print(f"\n-> {d/'backlog.md'}   challenger: {chal.get('verdict')}  ({len(b.get('stories',[]))} stories, {len(chal.get('findings',[]))} findings)")
+    print(f"   forge backlog show {project}   |   forge backlog approve {project}")
+
+def cmd_backlog_resolve(c, project, doc_override=None):
+    """Walk challenger findings + questions one at a time; write decisions into the document; record dismissals."""
+    d = disc_dir(c, project)
+    chal = json.loads((d / "challenger.json").read_text()) if (d / "challenger.json").exists() else die("no challenger output; run discover first")
+    sp = d / "status.json"
+    doc_path = Path(doc_override) if doc_override else (Path(json.loads(sp.read_text()).get("doc", "")) if sp.exists() else None)
+    if not doc_path or not doc_path.exists(): die("cannot find the decisions document; pass --doc decisions/trainer.md")
+    doc = doc_path.read_text()
+    res_p = d / "resolutions.json"; res = json.loads(res_p.read_text()) if res_p.exists() else {"accepted": [], "dismissed": [], "answers": []}
+    items = [("finding", f) for f in g(chal, "findings", [])] + [("question", {"question": q}) for q in g(chal, "questions_for_human", [])]
+    items += [("missing", m) for m in g(chal, "missing_stories", [])]
+    print(f"{len(items)} item(s). a = accept the fix as a decision, d <reason> = dismiss with a reason, ? = ask the challenger to expand, s = skip, or type your own decision.\n")
+    decisions = []
+    for i, (kind, it) in enumerate(items, 1):
+        if kind == "finding":
+            head = f"[{g(it,'severity')}] {g(it,'target')}: {g(it,'issue')}"; fix = g(it, "fix") or "(no fix given)"
+            print(f"[{i}/{len(items)}] {head}\n      proposed fix: {fix}")
+        elif kind == "missing":
+            head = f"missing story: {g(it,'title')}"; fix = f"add story: {g(it,'title')}"
+            print(f"[{i}/{len(items)}] {head}\n      why: {g(it,'why')}")
+        else:
+            head = g(it, "question"); fix = None
+            print(f"[{i}/{len(items)}] question: {head}")
+        while True:
+            try: a = input("    > ").strip()
+            except EOFError: print(); a = "s"
+            if a.lower() == "a" and not fix:
+                print("      nothing to accept on a question; type your answer"); continue
+            if a == "?":
+                model = (c.get("models") or {}).get("discover_challenger", "sonnet")
+                body = f"DOCUMENT:\n{doc}\n\nYou previously raised this item:\n{json.dumps(it, indent=1)}\n\nIn at most 8 lines: why it matters for THIS project, what breaks if ignored, and the smallest concrete decision the human could make to close it. Cite D/P/Q ids. No JSON, plain text."
+                cmd = ["claude", "-p", "--output-format", "json", "--max-turns", "1", "--permission-mode", "acceptEdits", "--settings", str(REVIEWER_SETTINGS), "--allowedTools", "Read", "--model", model]
+                r = subprocess.run(cmd, input=body, cwd=c["repo"], text=True, capture_output=True, env=agent_env(c))
+                ledger_record("challenger", model, f"{project}:resolve", r.stdout)
+                try: print("      " + json.loads(r.stdout).get("result", "").strip().replace("\n", "\n      "))
+                except Exception: print("      (no answer: " + r.stderr.strip()[:200] + ")")
+                continue
+            break
+        if a == "" or a.lower() == "s": print("      skipped\n"); continue
+        if a.lower() == "a":
+            res["accepted"].append({"item": head, "fix": fix}); decisions.append(f"{head} → {fix}"); print(f"      accepted\n")
+        elif a.lower().startswith("d"):
+            reason = a[1:].strip() or "no reason given"
+            res["dismissed"].append({"item": head, "reason": reason}); decisions.append(f"DISMISSED: {head} — reason: {reason}"); print(f"      dismissed\n")
+        else:
+            res["answers"].append({"item": head, "answer": a}); decisions.append(f"{head} → {a}"); print(f"      recorded\n")
+    if not decisions: print("nothing recorded"); return
+    res_p.write_text(json.dumps(res, indent=2))
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    block = f"\n\n## DECISIONS from challenger review ({stamp})\n\nThese override earlier D/P items where they conflict. DISMISSED lines are closed; do not raise them again.\n\n" + "\n".join(f"- {x}" for x in decisions) + "\n"
+    doc_path.write_text(doc.rstrip() + block)
+    print(f"wrote {len(decisions)} decision(s) to {doc_path}\nnext: forge discover {doc_path} --project {project}   (one re-run; the challenger sees your dismissals)")
+
+def cmd_backlog(args):
+    if len(args) < 2: die("usage: forge backlog render|show|resolve|approve NAME")
+    c = cfg(); sub, project = args[0], args[1]; d = disc_dir(c, project)
+    if not (d / "backlog.json").exists(): die(f"no backlog for {project}; run forge discover first")
+    if sub == "resolve":
+        cmd_backlog_resolve(c, project, args[args.index("--doc") + 1] if "--doc" in args else None); return
+    if sub == "render":
+        load_j = lambda n: json.loads((d / f"{n}.json").read_text()) if (d / f"{n}.json").exists() else {}
+        b2 = load_j("backlog"); (d / "backlog.md").write_text(render_backlog_md(b2, load_j("architecture"), load_j("tests"), load_j("finance"), load_j("challenger")))
+        if not (d / "status.json").exists() or json.loads((d / "status.json").read_text()).get("status") != "approved":
+            (d / "status.json").write_text(json.dumps({"project": project, "status": "draft", "doc": (json.loads((d / "status.json").read_text()).get("doc") if (d / "status.json").exists() else ""), "updated": now()}))
+        ch = load_j("challenger"); print(f"rendered {d/'backlog.md'}   challenger: {g(ch,'verdict')}  ({len(g(b2,'stories',[]))} stories, {len(g(ch,'findings',[]))} findings)"); return
+    if sub == "show": print((d / "backlog.md").read_text()); return
+    if sub == "approve":
+        b = json.loads((d / "backlog.json").read_text()); chal = json.loads((d / "challenger.json").read_text())
+        if chal.get("verdict") == "REVISE" and "--force" not in args:
+            die("challenger verdict is REVISE; fix the decisions doc and re-run discover, or pass --force")
+        done = [st["id"] for st in b["stories"] if st.get("key") and st["key"] != st["id"]]
+        if done and "--no-create" not in args: die(f"issues already exist for {', '.join(done[:5])}{'…' if len(done) > 5 else ''}; approve is not re-runnable (it would duplicate them)")
+        for st in b["stories"]:
+            stale = ROOT / "tickets" / f"{st['id']}.md"
+            if stale.exists(): stale.unlink()
+        if "--no-create" not in args: ensure_labels(c)
+        written = []; keymap = {}
+        order = [sid for sid in b.get("order", [])] + [st["id"] for st in b["stories"] if st["id"] not in b.get("order", [])]
+        for sid in order:
+            st = next((x for x in b["stories"] if x["id"] == sid), None)
+            if not st or not st.get("forgeable", True): continue
+            deps = ", ".join(f"#{keymap[d]}" if d in keymap and tracker(c).get("kind") == "github" else keymap.get(d, d) for d in st.get("depends_on", []))
+            body = (f"project: {project}\nrepo: {st.get('repo','')}\ncomplexity: {st.get('complexity','')}\ntraces: {', '.join(st.get('traces', []))}\n"
+                    f"depends on: {deps or '—'}\n\n{st.get('description','')}\n\n## Acceptance\n" + "\n".join(f"- {a}" for a in st.get("acceptance", [])))
+            key = tracker_create(c, st["title"], body) if "--no-create" not in args else None
+            if key is None and "--no-create" not in args:
+                (d / "backlog.json").write_text(json.dumps(b, indent=2))
+                die(f"stopped at {st['id']} after creating {len(written)} issue(s); keys so far are saved, fix the cause and close those issues before re-running")
+            key = key or st["id"]; keymap[st["id"]] = key; st["key"] = key
+            (ROOT / "tickets" / f"{key}.md").write_text(f"# {key} {st['title']}\n\n{body}")
+            written.append(key)
+        (d / "backlog.json").write_text(json.dumps(b, indent=2))
+        for repo_name, path in repos(c).items():
+            src = d / f"CLAUDE.{repo_name}.md"
+            if src.exists() and Path(path).is_dir():
+                dst = Path(path) / "CLAUDE.md"
+                if dst.exists() and "--overwrite-claude-md" not in args: print(f"  {dst} exists; left alone (pass --overwrite-claude-md)")
+                else: dst.write_text(redact(c, src.read_text())); print(f"  wrote {dst}")
+        (d / "status.json").write_text(json.dumps({"project": project, "status": "approved", "updated": now()}))
+        manual = [st["id"] for st in b["stories"] if not st.get("forgeable", True)]
+        kind = tracker(c).get("kind", "none")
+        print(f"approved {project}: {len(written)} tickets -> tickets/ " + (f"and created on {kind}" if kind != "none" and "--no-create" not in args else "") + f"  (build order: {', '.join(keymap.get(x, x) for x in b.get('order', []))})")
+        if manual: print(f"manual stories, not ticketed: {', '.join(manual)}")
+        print(f"next: forge refine {keymap.get(b.get('order', [''])[0], '<ID>')}")
+
+# ---------------------------------------------------------------- finance
+
+def cmd_finance(args):
+    c = cfg(); rows = ledger_rows()
+    if not args or args[0] == "report":
+        by = lambda k: {v: round(sum(r["cost_usd"] for r in rows if r.get(k) == v), 4) for v in sorted({r.get(k) for r in rows})}
+        total = round(sum(r["cost_usd"] for r in rows), 4)
+        week = [r for r in rows if (datetime.now(timezone.utc) - datetime.strptime(r["t"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).days < 7]
+        top = sorted(by("ref").items(), key=lambda kv: -kv[1])[:5]
+        L = [f"*forge finance* {datetime.now():%Y-%m-%d}", f"agent spend (notional USD): total {total}, last 7 days {round(sum(r['cost_usd'] for r in week),4)} over {len(week)} runs",
+             "by role: " + ", ".join(f"{k} {v}" for k, v in by("role").items()),
+             "by model: " + ", ".join(f"{k} {v}" for k, v in by("model").items()),
+             "top refs: " + ", ".join(f"{k} {v}" for k, v in top)]
+        for d in (plans_dir(c) / "_discovery").glob("*/finance.json") if (plans_dir(c) / "_discovery").exists() else []:
+            fin = json.loads(d.read_text()); rt = fin.get("run_total_per_month", {})
+            L += [f"project {d.parent.name}: run cost {rt.get('low')}–{rt.get('high')} {rt.get('currency','')}/month; unpriced: {', '.join(rt.get('unpriced', [])) or 'none'}"]
+            if fin.get("drift"): L += ["  drift: " + "; ".join(x["what"] for x in fin["drift"])]
+            if fin.get("stale_facts"): L += ["  recheck: " + "; ".join(fin["stale_facts"][:3])]
+        L += outcomes_table()
+        txt = "\n".join(L); print(txt)
+        if "--post" in args: slack(c, txt)
+        return
+    die("usage: forge finance report [--post]")
+
+MIN_CELL = 10
+def outcomes_table():
+    """Per tier x complexity: n, first-pass accept, escalations, red rounds, false accepts (lower bound), cost, elapsed review. Tolerates tasks with no round_log."""
+    cells = {}; legacy = 0
+    for tid, spec, st in all_tasks():
+        log = st.get("round_log") or []
+        if not any(r.get("verdict") or (r.get("outcome") in ("human_approved", "human_rejected") and r.get("tag") != "env") for r in log):
+            if st.get("state") == "approved": legacy += 1   # approved before the round log existed: no rates derivable
+            continue
+        arm = "control(opus)" if spec.get("control") else "tiered"
+        cx = spec.get("complexity", "medium")
+        k = (arm, cx); cell = cells.setdefault(k, {"n": 0, "first_pass": 0, "escalated": 0, "red_rounds": 0, "false_accept": 0, "cost": 0.0, "review_s": []})
+        cell["n"] += 1
+        verdicts = [r for r in log if r.get("verdict")]
+        first = verdicts[0] if verdicts else None
+        human = [r for r in log if r.get("outcome") in ("human_approved", "human_rejected")]
+        if first and first.get("verdict") == "APPROVE" and not any(r.get("outcome") == "human_rejected" for r in human): cell["first_pass"] += 1
+        if any((r.get("round") or 0) > 0 for r in log): cell["escalated"] += 1
+        cell["red_rounds"] += sum(1 for r in log if r.get("outcome") == "tests_red")
+        cell["false_accept"] += sum(1 for r in log if r.get("false_accept"))
+        cell["cost"] += task_cost(tid)
+        cell["review_s"] += [r["elapsed_review_s"] for r in log if r.get("elapsed_review_s") is not None]
+    if not cells: return ["outcomes: no reviewed rounds recorded yet" + (f" ({legacy} approved before round logging)" if legacy else "")]
+    out = ["outcomes by arm/complexity (n<%d marked insufficient; false accepts are a lower bound; review time is elapsed, capped 45 min, not attention%s):"
+           % (MIN_CELL, f"; {legacy} task(s) approved before round logging excluded" if legacy else "")]
+    for (arm, cx), v in sorted(cells.items()):
+        med = sorted(v["review_s"])[len(v["review_s"]) // 2] if v["review_s"] else None
+        flag = "" if v["n"] >= MIN_CELL else "  [insufficient]"
+        out.append(f"  {arm:14} {cx:6} n={v['n']:<3} first-pass {v['first_pass']}/{v['n']}  escalated {v['escalated']}  red rounds {v['red_rounds']}  false accepts {v['false_accept']}  "
+                   f"cost/subtask {round(v['cost']/v['n'],3)}  elapsed review median {f'{med//60}m{med%60:02d}s' if med is not None else '-'}{flag}")
+    return out
+
+# ---------------------------------------------------------------- init
+
+def cmd_init(_):
+    if not shutil.which("claude"): die("claude CLI not found on PATH (npm i -g @anthropic-ai/claude-code)")
+    if not shutil.which("git"): die("git not found")
+    c = cfg()
+    guard = str(ROOT / "bin" / "guard.py")
+    hooks = {"hooks": {"PreToolUse": [{"matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+                                       "hooks": [{"type": "command", "command": f"python3 {shlex.quote(guard)}"}]}]}}
+    WORKER_SETTINGS.parent.mkdir(exist_ok=True)
+    WORKER_SETTINGS.write_text(json.dumps(hooks, indent=2))
+    REVIEWER_SETTINGS.write_text(json.dumps(hooks, indent=2))
+    for d in (TASKS, LOGS, WT_ROOT): d.mkdir(exist_ok=True)
+    gi = Path(c["repo"]) / ".git" / "info" / "exclude"
+    if gi.exists() and "FORGE_SUMMARY.md" not in gi.read_text():
+        gi.write_text(gi.read_text() + "\nFORGE_SUMMARY.md\n")
+    v = sh(["claude", "--version"]).stdout.strip()
+    print(f"ok  claude {v}\nok  hooks -> {WORKER_SETTINGS}")
+    for name, path in repos(c).items():
+        if not Path(path).is_dir(): print(f"!!  repo {name}: {path} does not exist"); continue
+        ok, rn, re_ = check_identity(c, path)
+        i = identity(c)
+        who = f"{i.get('name', rn)} <{i.get('email', re_)}>"
+        flag = "ok " if (ok or not i) else "!! "
+        print(f"{flag} repo {name}: {path}\n     git resolves: {rn or '(unset)'} <{re_ or '(unset)'}>   forge will commit as: {who}" + ("" if ok or not i else "   <- MISMATCH: forge.json identity overrides"))
+    t = tracker(c)
+    if t.get("kind") == "github":
+        r = sh("gh auth status 2>&1", check=False); active = [l.strip() for l in r.stdout.splitlines() if "Logged in" in l]
+        print(f"ok  gh accounts: {', '.join(active) or 'none logged in'}" + (f"   forge will use: {t.get('gh_user')}" if t.get("gh_user") else "   (set tracker.gh_user to pin one)"))
+    if t.get("kind") == "jira": print(f"ok  jira via: {t.get('view','').split()[0] if t.get('view') else '(unset)'}")
+
+# ---------------------------------------------------------------- plan / add
+
+def render_plan_md(key, plan):
+    L = [f"# {key} — {plan.get('title','')}", "", f"ready: {plan.get('ready', True)}   status: {plan.get('_status','draft')}", ""]
+    if plan.get("questions"):
+        L += ["## Questions for the human"] + [f"- {q}" for q in plan["questions"]] + [""]
+    ctx = plan.get("context", {})
+    if ctx:
+        L += ["## Context", "key files:"] + [f"- {k}" for k in ctx.get("key_files", [])]
+        L += ["conventions:"] + [f"- {k}" for k in ctx.get("conventions", [])]
+        L += [f"single-test command: `{ctx.get('test_cmd_single','')}`", ""]
+    for st in plan.get("subtasks", []):
+        L += [f"## {st['id']}  [{st.get('complexity','medium')}]", st["goal"], ""]
+        if st.get("depends_on"): L += [f"depends on: {', '.join(st['depends_on'])}"]
+        L += ["files:"] + [f"- {f}" for f in st.get("files", [])]
+        if st.get("interfaces"): L += ["interfaces:"] + [f"- `{i}`" for i in st["interfaces"]]
+        L += ["tests:"] + [f"- {t['file']} :: {t['name']} — {t['asserts']}" for t in st.get("tests_to_write", [])]
+        L += ["steps:"] + [f"{x}" if re.match(r"^\d+\.", x) else f"- {x}" for x in st.get("steps", [])]
+        L += ["acceptance:"] + [f"- {a}" for a in st.get("acceptance", [])]
+        if st.get("out_of_scope"): L += ["out of scope:"] + [f"- {o}" for o in st["out_of_scope"]]
+        L += [""]
+    return "\n".join(L)
+
+def write_plan(c, key, plan, ticket_path):
+    d = plans_dir(c) / key; d.mkdir(exist_ok=True)
+    plan["_key"] = key; plan["_ticket"] = str(ticket_path); plan.setdefault("_status", "draft"); plan["_updated"] = now()
+    (d / "plan.json").write_text(json.dumps(plan, indent=2))
+    (d / "plan.md").write_text(render_plan_md(key, plan))
+    return d
+
+def read_plan(c, key):
+    p = plans_dir(c) / key / "plan.json"
+    if not p.exists(): die(f"no plan for {key} (looked in {p})")
+    return json.loads(p.read_text())
+
+def run_planner(c, ticket_text, prev=None, feedback=None, repo=None):
+    stamp = datetime.now().strftime("%m%d-%H%M%S")
+    xflags, xnote = cross_repo(c)
+    cmd = claude_cmd(c, PROMPTS / "planner.md", REVIEWER_SETTINGS, ["Read", "Glob", "Grep", "LS"], 60, model_for(c, "planner"), extra=xflags)
+    body = f"TICKET:\n\n{ticket_text}\n\n{xnote}"
+    if prev: body += f"\n\nPREVIOUS PLAN:\n{json.dumps({k: v for k, v in prev.items() if not k.startswith('_')}, indent=2)}"
+    if feedback: body += f"\n\nHUMAN FEEDBACK ON THE PREVIOUS PLAN:\n{feedback}"
+    print(f"planning with {model_for(c, 'planner')}…", flush=True)
+    r = subprocess.run(cmd, input=body, cwd=repo or c["repo"], text=True, capture_output=True, env=agent_env(c))
+    (LOGS / f"plan-{stamp}.log").write_text(r.stdout + "\n--- stderr ---\n" + r.stderr)
+    if r.returncode != 0: die(f"planner failed, see logs/plan-{stamp}.log")
+    ledger_record("planner", model_for(c, "planner"), stamp, r.stdout)
+    return extract_json(json.loads(r.stdout).get("result", ""))
+
+def cmd_plan(args):
+    if not args: die("usage: forge plan <ticket.md|KEY> [--repo NAME] | show KEY | revise KEY \"feedback\" | extend KEY \"defect\" [--defect-in sub1,sub2] | approve KEY | withdraw KEY | list")
+    c = cfg(); sub = args[0]
+    if sub == "list":
+        for d in sorted(plans_dir(c).iterdir()):
+            if (d / "plan.json").exists():
+                p = json.loads((d / "plan.json").read_text())
+                print(f"{p.get('_status','draft'):9} {d.name:12} {len(p.get('subtasks',[])):2} subtasks  ready={p.get('ready')}  {p.get('title','')}")
+        return
+    if sub == "show":
+        print((plans_dir(c) / args[1] / "plan.md").read_text()); return
+    if sub == "answer":
+        if len(args) >= 4 and args[2].isdigit(): direct_answer(c, args[1], int(args[2]), args[3], "plan"); return
+        plan_answer(c, args[1], "--auto" in args); return
+    if sub == "revise":
+        key, fb = args[1], args[2]
+        prev = read_plan(c, key); plan = run_planner(c, Path(prev["_ticket"]).read_text(), prev, fb, repo=repos(c).get(prev.get("_repo")))
+        plan["_repo"] = prev.get("_repo")
+        d = write_plan(c, key, plan, prev["_ticket"]); print(f"revised -> {d/'plan.md'}"); _plan_report(key, plan, d); return
+    if sub == "extend":
+        # A defect found after merge (typically by an owner-run live test): the planner adds subtasks to an approved plan; nothing existing is re-run.
+        key, defect = args[1], args[2]; prev = read_plan(c, key); rpath = repos(c).get(prev.get("_repo")) or c["repo"]
+        for k, a in enumerate(args):
+            if a != "--evidence" or k + 1 >= len(args): continue
+            evp = Path(os.path.expanduser(args[k + 1]))
+            if not evp.exists(): die(f"evidence file not found: {evp}")
+            txt = evp.read_text()
+            if "media_session" in evp.name or "Sessions Stack" in txt:
+                mf = media_session_facts(txt)
+                keep = [f"media button session: {mf['button'] or 'none'}", "sessions registered: " + (", ".join(f"{p_} ({'active' if v['active'] else 'inactive'}, {v['state']})" for p_, v in mf["sessions"].items()) or "none"), "audio playback, most recent first: " + (", ".join(mf["playing"]) or "none")]
+                defect += "\n\nEVIDENCE (dumpsys media_session, " + evp.name + "):\n" + "\n".join(keep)
+            else:
+                keep = [l for l in txt.splitlines() if re.search(rf"{re.escape(c.get('log_tag') or 'app')}|MediaSession|TestRunner|AndroidRuntime|KEYCODE", l)][-120:]
+                defect += "\n\nEVIDENCE (device log excerpt, " + evp.name + "):\n" + "\n".join(keep)
+        fb = ("DEFECT FOUND AFTER MERGE. The previous plan's subtasks are already merged into main; do NOT repeat or modify them. "
+              "Return the same JSON shape with ONLY NEW subtasks (new ids) that fix the defect below, with tests first, honouring the design rules. "
+              "Read the merged code in the repo before planning.\n\nDEFECT:\n" + defect)
+        plan = run_planner(c, Path(prev["_ticket"]).read_text(), prev, fb, repo=rpath)
+        have = {st["id"] for st in prev["subtasks"]}
+        new = [st for st in plan.get("subtasks", []) if st["id"] not in have]
+        if not new: die("planner returned no new subtasks")
+        prev["subtasks"] += new; prev.setdefault("_extensions", []).append({"t": now(), "defect": defect, "added": [st["id"] for st in new]})
+        write_plan(c, key, prev, Path(prev["_ticket"]))
+        ids = []
+        for st in new:
+            tid = f"{key}--{st['id']}"[:60]
+            spec = dict(st); spec.update({"ticket": key, "jira": jira_key(key), "title": prev.get("title", key), "repo": prev.get("_repo"),
+                                          "plan_path": str(plans_dir(c) / key / "plan.json"), "context": prev.get("context", {}), "files_likely": st.get("files", [])})
+            save(tid, "spec.json", spec)
+            set_state(tid, "owner" if st.get("owner") else "queued", rounds=0, red_rounds=0); ids.append(tid)
+        for t in ids: print(f"  {t}  [{'OWNER' if load(t,'spec.json').get('owner') else load(t,'spec.json').get('complexity','medium')}]")
+        if "--defect-in" in args:   # record the post-merge defect against the subtasks that produced it, for the false-accept count
+            for t in args[args.index("--defect-in") + 1].split(","):
+                t = t if t.startswith(key) else f"{key}--{t}"
+                if load(t, "state.json"): round_log(t, outcome="post_merge_defect", false_accept=True, reason=defect[:200])
+        print(f"extended {key} with {len(ids)} subtask(s); the loop picks them up")
+        return
+    if sub == "withdraw":
+        # un-approve: drop the queued/owner task dirs so the plan can be regenerated; anything already started must be cleaned first
+        key = args[1]; plan = read_plan(c, key)
+        mine = [(t, st) for t, _, st in all_tasks() if t.startswith(f"{key}--")]
+        busy = [t for t, st in mine if st.get("state") not in ("queued", "owner", "running", "failed")]
+        if busy: die(f"cannot withdraw {key}: {', '.join(busy)} have reviewed or approved work; this is for plans nothing has come out of yet")
+        for t, st in mine:
+            if st.get("state") == "running" and st.get("pid") and pid_alive(st["pid"]):
+                try: os.killpg(st["pid"], 15)
+                except Exception: pass
+                print(f"stopped worker for {t}")
+            if st.get("worktree") or st.get("branch"): cmd_clean([t])
+            shutil.rmtree(TASKS / t, ignore_errors=True)
+        plan["_status"] = "draft"; write_plan(c, key, plan, plan["_ticket"])
+        print(f"withdrew {key}: removed {len(mine)} task(s); plan is a draft again (forge plan {key} [--repo NAME] to regenerate, or forge plan approve {key} to requeue as is)")
+        return
+    if sub == "approve":
+        key = args[1]; plan = read_plan(c, key)
+        if plan.get("_status") == "approved": die(f"{key} already approved")
+        names = list(repos(c)); warn = []
+        for st in plan.get("subtasks", []):
+            if st.get("repo") and st["repo"] not in names: die(f"subtask {st['id']} names repo '{st['repo']}', which forge.json does not map ({', '.join(names)})")
+            mine = st.get("repo") or plan.get("_repo")
+            text = " ".join(str(st.get(k, "")) for k in ("goal", "steps", "files", "files_likely", "interfaces"))
+            others = [n for n in names if n != mine and re.search(rf"\b([\w]+-)?{re.escape(n)}\b", text)]
+            if others: warn.append(f"  {st['id']}: assigned to {mine} but its text names {', '.join(others)}")
+        if warn:
+            print("subtasks that may be in the wrong repo (a worker can only change the repo it is assigned to):\n" + "\n".join(warn))
+            if sys.stdin.isatty() and input("approve anyway? [y/N] ").strip().lower() != "y": die("not approved; fix with forge plan revise " + key + ' "subtask X belongs in repo Y"')
+        if not plan.get("ready", True) and "--force" not in args:
+            die(f"{key} has open questions (ready=false). Run `forge plan answer {key}` (tech lead drafts, you confirm, planner revises), or pass --force to plan around them.")
+        ids = []
+        for st in plan["subtasks"]:
+            tid = f"{key}--{st['id']}"[:60]
+            spec = dict(st); spec.update({"ticket": key, "jira": jira_key(key), "title": plan.get("title", key), "repo": st.get("repo") or plan.get("_repo"),
+                                          "plan_path": str(plans_dir(c) / key / "plan.json"),
+                                          "context": plan.get("context", {}), "files_likely": st.get("files", [])})
+            if not st.get("owner") and st.get("complexity", "medium") in ("low", "medium") and random.random() < float(c.get("opus_control_rate", 0)):
+                spec["control"] = True   # control arm: starts on opus so tier cost can be compared on observed runs
+            save(tid, "spec.json", spec)
+            if st.get("owner"): set_state(tid, "owner", rounds=0, red_rounds=0)   # no worker: the owner does this one and marks it with forge approve
+            else: set_state(tid, "queued", rounds=0, red_rounds=0)
+            ids.append(tid)
+        plan["_status"] = "approved"; write_plan(c, key, plan, plan["_ticket"])
+        if jira_key(key):
+            jira_transition(c, key, "in_progress")
+            jira_comment(c, key, "Plan approved. Subtasks: " + ", ".join(st["id"] for st in plan["subtasks"]))
+        print(f"approved {key}: {len(ids)} task(s) queued")
+        print("next: forge status (check the repo column), then forge loop if it is not already running")
+        for t in ids:
+            sp = load(t, "spec.json")
+            print(f"  {t}  [OWNER: forge owner run {t} when its dependencies are approved]" if sp.get("owner") and sp.get("owner_run") else f"  {t}  [OWNER: no script; do it by hand, then forge approve {t}]" if sp.get("owner") else f"  {t}  [{sp.get('complexity','medium')} -> {'opus (control)' if sp.get('control') else model_for(c,'worker',sp.get('complexity','medium'))}]")
+        return
+    # default: plan a ticket — by key (fetched via Jira CLI) or by file path
+    if Path(sub).exists():
+        tpath = Path(sub); ticket = tpath.read_text(); key = jira_key(tpath.stem, ticket)
+    else:
+        key = jira_key(sub) or die(f"'{sub}' is neither a file nor a Jira key")
+        tpath = ticket_path(key); ticket = tpath.read_text() if tpath.exists() else cmd_ticket([key])
+    if c.get("require_key", c.get("require_jira_key", True)) and not key: die("no tracker key in the ticket filename or text (set require_key: false for free-form ids)")
+    key = key or re.sub(r"[^a-z0-9]+", "-", tpath.stem.lower()).strip("-")[:24]
+    r = load_refine(c, key)
+    if c.get("require_refine", True) and "--force" not in args and not (r and r.get("_accepted")):
+        die(f"{key} has not been accepted as READY. Run `forge refine {key}` then `forge refine accept {key}`, or pass --force.")
+    if r: ticket += "\n\nREFINEMENT (already answered/accepted):\n" + json.dumps({k: v for k, v in r.items() if not k.startswith("_")}, indent=2)
+    m = re.search(r"^repo:\s*([\w-]+)", ticket, re.M)
+    want = args[args.index("--repo") + 1] if "--repo" in args else (m.group(1) if m else None)
+    mapped = [k for k in repos(c) if not k.startswith("_")]
+    if not want and len(mapped) > 1:
+        die(f"{key} names no repo and {len(mapped)} are mapped ({', '.join(mapped)}). Add a `repo: <name>` line to the issue body, or run `forge plan {key} --repo <name>`.")
+    if want and want not in repos(c): die(f"repo '{want}' is not in forge.json repos ({', '.join(mapped)})")
+    rname, rpath, _, _ = repo_for(c, want)
+    print(f"planning {key} in repo '{rname}' ({rpath})")
+    plan = run_planner(c, ticket, repo=rpath)
+    plan["_repo"] = rname
+    d = write_plan(c, key, plan, tpath)
+    _plan_report(key, plan, d)
+
+def _plan_report(key, plan, d):
+    print(f"\nplan -> {d/'plan.md'}   (nothing runs until: forge plan approve {key})")
+    if plan.get("questions"):
+        print(f"\nPLANNER HAS {len(plan['questions'])} QUESTION(S):   → forge plan answer {key}")
+        for q in plan["questions"]:
+            print(f"  ? [{q.get('to','?')}] {q.get('question')}" if isinstance(q, dict) else f"  ? {q}")
+    print(f"\n{len(plan.get('subtasks', []))} subtask(s):")
+    for st in plan.get("subtasks", []):
+        print(f"  {st['id']:30} [{st.get('complexity','medium'):6}] {len(st.get('steps',[])):2} steps  {st['goal'][:70]}")
+
+def cmd_add(args):
+    if not args: die('usage: forge add "<goal>" --issue N --repo NAME [--accept "<check>"]...')
+    goal = args[0]; accept = []; key = jira_key(goal); rname = None
+    it = iter(args[1:])
+    for a in it:
+        if a == "--accept": accept.append(next(it))
+        elif a in ("--jira", "--key", "--issue"): key = next(it)
+        elif a == "--repo": rname = next(it)
+    c = cfg()
+    if c.get("require_key", c.get("require_jira_key", True)) and not key: die("pass --issue <number> (or --key <id>, or put the key in the goal)")
+    mapped = [k for k in repos(c) if not k.startswith("_")]
+    if not rname and len(mapped) > 1: die(f"{len(mapped)} repos are mapped ({', '.join(mapped)}): pass --repo <name> so the worker runs in the right one")
+    if rname and rname not in repos(c): die(f"repo '{rname}' is not in forge.json repos ({', '.join(mapped)})")
+    slug = re.sub(r"[^a-z0-9]+", "-", goal.lower()).strip("-")[:32].rstrip("-")
+    tid = (f"{key}--{slug}" if key else f"adhoc--{slug}-{datetime.now():%H%M}")
+    if (TASKS / tid).exists(): tid += f"-{datetime.now():%H%M}"
+    save(tid, "spec.json", {"id": tid, "title": goal, "goal": goal, "acceptance": accept or [f"{c['test_cmd']} passes"],
+                            "files_likely": [], "files": [], "out_of_scope": [], "depends_on": [], "ticket": key or "adhoc", "jira": key, "complexity": "medium", "steps": [], "repo": rname})
+    set_state(tid, "queued", rounds=0); print(tid)
+
+# ---------------------------------------------------------------- scheduler
+
+def deps_ok(spec):
+    for d in spec.get("depends_on", []):
+        full = [t for t, _, _ in all_tasks() if t.endswith("--" + d) or t == d]
+        if not full: continue
+        if (load(full[0], "state.json") or {}).get("state") != "approved": return False
+    return True
+
+def worker_prompt(spec, feedback=None):
+    keys = ("goal", "complexity", "files", "interfaces", "tests_to_write", "steps", "acceptance", "out_of_scope")
+    p = ["APPROVED PLAN — SUBTASK:", json.dumps({k: spec[k] for k in keys if k in spec}, indent=2)]
+    if spec.get("context"): p += ["", "REPO CONTEXT (from the plan):", json.dumps(spec["context"], indent=2)]
+    if feedback: p += ["", "REWORK — the reviewer rejected the previous attempt. Address every point:", feedback]
+    return "\n".join(p)
+
+ENV_FAILURE_PATTERNS = [r"command not found", r"No such file or directory", r"Could not resolve", r"Could not connect to the Docker daemon",
+                        r"Cannot connect to the Docker daemon", r"docker: not found", r"Timed out waiting for the Gradle daemon",
+                        r"Unable to start the daemon process", r"JAVA_HOME is", r"Received status code 5\d\d", r"Connection refused", r"Connection reset"]
+
+def run_gate(cmd, cwd):
+    """Run the test or lint command. Returns (status, tail): status in green|red|env."""
+    if not cmd: return "green", ""
+    r = subprocess.run(cmd, cwd=cwd, shell=True, text=True, capture_output=True, env=agent_env(cfg()))
+    out = (r.stdout or "") + "\n" + (r.stderr or "")
+    tail = "\n".join(out.strip().splitlines()[-60:])
+    if r.returncode == 0: return "green", tail
+    if r.returncode == 127 or any(re.search(p, out) for p in ENV_FAILURE_PATTERNS): return "env", tail
+    return "red", tail
+
+def round_log(tid, **rec):
+    """Append one per-round record to state.json; tolerant of tasks created before the log existed."""
+    st = load(tid, "state.json") or {"id": tid, "history": []}
+    st.setdefault("round_log", []).append({"t": now(), **rec})
+    save(tid, "state.json", st); return st
+
+def task_cost(tid, role=None):
+    return round(sum(r["cost_usd"] for r in ledger_rows() if r.get("ref") == tid and (role is None or r.get("role") == role)), 4)
+
+SEED_FILES = ["local.properties", ".env.test", "gradle.properties.local"]   # gitignored files a build needs; copied from the main checkout
+
+def seed_worktree(c, rname, rpath, wt):
+    """A fresh worktree lacks the gitignored files the main checkout builds with; copy the known ones (and any forge.json repos[name].seed list)."""
+    entry = (c.get("repos") or {}).get(rname) or {}
+    names = SEED_FILES + (entry.get("seed", []) if isinstance(entry, dict) else [])
+    for n in names:
+        src = Path(rpath) / n
+        if src.exists() and not (Path(wt) / n).exists():
+            shutil.copy2(src, Path(wt) / n); print(f"  seeded {n} into the worktree")
+
+def sdk_env(env):
+    """Android SDK location for agents and gates: keep what the shell has, else Android Studio's default, else leave unset."""
+    if not env.get("ANDROID_HOME") and not env.get("ANDROID_SDK_ROOT"):
+        for cand in (Path.home() / "Library" / "Android" / "sdk", Path.home() / "Android" / "Sdk"):
+            if cand.exists(): env["ANDROID_HOME"] = str(cand); env["ANDROID_SDK_ROOT"] = str(cand); break
+    return env
+
+def start_worker(c, tid, spec, st):
+    rname, rpath, test_cmd, lint_cmd = repo_for(c, spec)
+    wt = WT_ROOT / tid
+    sub = tid.split("--", 1)[1] if "--" in tid else tid
+    branch = c["branch_prefix"] + (f"{tracker(c)['branch_key'].format(key=spec['jira'])}-{sub}" if spec.get("jira") else tid)
+    if wt.exists():   # a worktree left by an earlier round must belong to the task's current repo, or it is silently the wrong checkout
+        common = sh(["git", "rev-parse", "--git-common-dir"], cwd=wt, check=False).stdout.strip()
+        owner = Path(common).resolve().parent if common else None
+        if owner != Path(rpath).resolve():
+            print(f"{tid}: worktree belongs to {owner}, task is in {rname} ({rpath}); recreating")
+            sh(["git", "worktree", "remove", "--force", str(wt)], cwd=str(owner) if owner else rpath, check=False)
+            shutil.rmtree(wt, ignore_errors=True)
+            if owner: sh(["git", "branch", "-D", branch], cwd=str(owner), check=False)
+    if not wt.exists():
+        sh(["git", "fetch", "--quiet", "origin", c["base_branch"]], cwd=rpath, check=False)
+        base = f"origin/{c['base_branch']}" if sh(["git", "rev-parse", "--verify", f"origin/{c['base_branch']}"], cwd=rpath, check=False).returncode == 0 else c["base_branch"]
+        sh(["git", "worktree", "add", "-B", branch, str(wt), base], cwd=rpath)
+        seed_worktree(c, rname, rpath, wt)
+    feedback = (task_dir(tid) / "feedback.md").read_text() if (task_dir(tid) / "feedback.md").exists() else None
+    model = model_for(c, "worker", spec.get("complexity", "medium"), st.get("rounds", 0))
+    if spec.get("control"): model = c.get("models", {}).get("worker_high", "opus")   # randomised opus control arm, flagged at plan approve
+    if feedback and st.get("session_id") and model == st.get("model"): extra = ["--resume", st["session_id"]]
+    else: extra = []   # escalated to a new model: fresh session, feedback goes in the prompt
+    others = [(n, pth) for n, pth in repos(c).items() if n != rname]
+    xflags = [f for n, pth in others for f in ("--add-dir", pth)]
+    cmd = claude_cmd(c, PROMPTS / "worker.md", WORKER_SETTINGS, allowed_for_worker(c), c["worker_max_turns"], model, list(extra) + xflags)
+    xnote = ("\n\nOTHER REPOS, READ-ONLY (Read/Grep only; never run commands against them, never edit them; their state on main is current): " + "; ".join(f"{n} = {pth}" for n, pth in others)) if others else ""
+    prompt = worker_prompt(spec, feedback) + f"\n\nTest command: {test_cmd}" + (f"\nLint command: {lint_cmd}" if lint_cmd else "") + xnote
+    log = open(task_dir(tid) / "worker.log", "a")
+    log.write(f"\n===== start {now()} round={st.get('rounds', 0)} =====\n"); log.flush()
+    env = agent_env(c)
+    env["FORGE_WRITE_ROOT"] = str(Path(wt).resolve())
+    env["FORGE_PROTECT"] = os.pathsep.join(sorted({str(Path(p_).resolve()) for p_ in list(repos(c).values()) + [c.get("repo", "")] if p_}))
+    proc = subprocess.Popen(cmd, cwd=wt, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True, env=env)
+    proc.stdin.write(prompt); proc.stdin.close()
+    set_state(tid, "running", pid=proc.pid, started=now(), branch=branch, worktree=str(wt), model=model, repo_path=rpath, repo=rname)
+    print(f"▶ {tid} [{model}] in {rname} (pid {proc.pid})")
+
+def pid_alive(pid):
+    try: os.kill(pid, 0)
+    except OSError: return False
+    r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return bool(r.stdout.strip()) and not r.stdout.strip().startswith("Z")
+
+def reap(c, tid, spec, st):
+    """Worker finished (or died/timed out): capture patch, run reviewer."""
+    wt = Path(st["worktree"])
+    log = (task_dir(tid) / "worker.log").read_text()
+    sess = re.findall(r'"session_id"\s*:\s*"([^"]+)"', log)
+    last = [l for l in log.splitlines() if l.startswith("{") and '"total_cost_usd"' in l]
+    if last: ledger_record("worker", st.get("model"), tid, last[-1])
+    if sess: st = set_state(tid, st["state"], session_id=sess[-1])
+    diff = sh(["git", "diff", "--", ".", ":(exclude)FORGE_SUMMARY.md"], cwd=wt).stdout
+    untracked = sh(["git", "ls-files", "--others", "--exclude-standard"], cwd=wt).stdout.split()
+    for f in untracked:
+        if f != "FORGE_SUMMARY.md":
+            diff += sh(["git", "diff", "--no-index", "--", "/dev/null", f], cwd=wt, check=False).stdout
+    (task_dir(tid) / "patch.diff").write_text(diff)
+    summary = (wt / "FORGE_SUMMARY.md").read_text() if (wt / "FORGE_SUMMARY.md").exists() else "(worker wrote no summary)"
+    (task_dir(tid) / "summary.md").write_text(summary)
+    rnd = {"round": st.get("rounds", 0), "red_round": st.get("red_rounds", 0), "model": st.get("model"), "worker_cost": task_cost(tid, "worker")}
+    if not diff.strip():
+        kind, detail = no_changes_reason(tid, summary)
+        round_log(tid, **rnd, gate="none", outcome="no_changes", why=f"{kind}: {detail}"[:200])
+        if kind == "wrong-repo" and detail in repos(c) and detail == spec.get("repo"):
+            print(f"✗ {tid}: no changes; worker was in a worktree of the wrong repo although the task is in {detail}; dropping the worktree and re-queuing")
+            retarget(c, tid, detail); (task_dir(tid) / "feedback.md").write_text(f"Retried by forge: the previous attempt ran in the wrong checkout. This worktree is {detail}; the files are here.\n")
+            round_log(tid, round=st.get("rounds", 0), outcome="worktree_recreated"); set_state(tid, "queued", reason=None); return
+        if kind == "wrong-repo" and detail in repos(c) and detail != spec.get("repo"):
+            print(f"✗ {tid}: no changes; worker says the files live in {detail}; moving it there")
+            retarget(c, tid, detail); (task_dir(tid) / "feedback.md").write_text(f"Retargeted by forge: the previous attempt in {spec.get('repo')} found the files live in {detail}. Make the change here.\n")
+            round_log(tid, round=st.get("rounds", 0), outcome="retargeted", repo=detail); set_state(tid, "queued", reason=None); return
+        label = {"wrong-repo": f"wrong repo: {detail or 'unnamed'}", "already-done": f"already done: {detail}", "blocked": f"blocked: {detail}", "needs-decision": f"needs decision: {detail}"}.get(kind, f"unknown: {detail}")
+        set_state(tid, "failed", reason=label[:300]); print(f"✗ {tid}: no changes — {label[:120]}"); return
+    _, _, test_cmd, lint_cmd = repo_for(c, spec)
+    gate, tail = run_gate(test_cmd, wt)
+    if gate == "green" and lint_cmd:
+        gate, tail = run_gate(lint_cmd, wt); gate = "lint_red" if gate == "red" else gate
+    (task_dir(tid) / "gate.log").write_text(f"test: {test_cmd}\nlint: {lint_cmd}\nresult: {gate}\n\n{tail}")
+    if gate == "env":
+        round_log(tid, **rnd, gate="env", outcome="env_failure")
+        set_state(tid, "failed", reason="environment failure running tests; see gate.log"); print(f"✗ {tid}: environment failure (not counted); fix and `forge reject {tid} --tag env \"retry\"`"); return
+    if gate in ("red", "lint_red"):
+        prev_diff = (task_dir(tid) / "patch.prev").read_text() if (task_dir(tid) / "patch.prev").exists() else None
+        round_log(tid, **rnd, gate=gate, outcome="tests_red", same_diff_as_previous=(prev_diff == diff))
+        (task_dir(tid) / "patch.prev").write_text(diff)
+        red = st.get("red_rounds", 0) + 1
+        if red > c.get("max_red_rounds", 2):
+            set_state(tid, "needs_human", red_rounds=red, reason="tests_red"); print(f"● {tid}: still red after {red-1} red rounds; waiting for you"); return
+        (task_dir(tid) / "feedback.md").write_text(f"Tests are RED. Fix the failure; do not weaken or delete tests. Same model, same session.\n\n{tail}")
+        set_state(tid, "queued", red_rounds=red); print(f"↺ {tid}: tests red, back to {st.get('model')} (red round {red}, no escalation)"); return
+    rmodel, forced_high = reviewer_model(c, st.get("model"))
+    set_state(tid, "reviewing"); print(f"⋯ {tid}: gate green, tech-lead review by {rmodel}" + (" (opus work: human review forced)" if forced_high else ""))
+    cmd = claude_cmd(c, PROMPTS / "tech-lead.md", REVIEWER_SETTINGS, allowed_for_reviewer(c, test_cmd, lint_cmd), 25, rmodel)
+    body = f"MODE REVIEW\n\nSPEC:\n{json.dumps(spec, indent=2)}\n\nWORKER SUMMARY:\n{summary}\n\nTest command: {test_cmd}\nLint command: {lint_cmd or '(none)'}\n\nDIFF:\n{diff[:120000]}"
+    r = subprocess.run(cmd, input=body, cwd=wt, text=True, capture_output=True, env=agent_env(c))
+    (task_dir(tid) / "reviewer.log").write_text(r.stdout + "\n--- stderr ---\n" + r.stderr)
+    ledger_record("reviewer", rmodel, tid, r.stdout)
+    try: review = extract_json(json.loads(r.stdout)["result"])
+    except Exception as e:
+        review = {"verdict": "UNPARSED", "risk": "high", "summary_for_human": f"reviewer output unparseable ({e}); review manually", "findings": []}
+    if forced_high:
+        review["risk"] = "high"
+        review["summary_for_human"] = f"[{st.get('model')} work reviewed by {rmodel}; no stronger model available, so your review is the second opinion]\n" + (review.get("summary_for_human") or "")
+    save(tid, "review.json", review)
+    (task_dir(tid) / f"review.r{st.get('rounds',0)}.json").write_text(json.dumps(review, indent=2))
+    round_log(tid, **rnd, gate="green", reviewer=rmodel, verdict=review.get("verdict"), risk=review.get("risk"),
+              findings=len(review.get("findings", [])), reviewer_cost=task_cost(tid, "reviewer"))
+    if review["verdict"] == "REJECT" and st.get("rounds", 0) < c["max_rework_rounds"]:
+        fb = "\n".join(f"- [{f['severity']}] {f.get('file','')}:{f.get('line','')} {f['issue']} -> {f['fix']}" for f in review.get("findings", []))
+        (task_dir(tid) / "feedback.md").write_text("Automated reviewer findings:\n" + fb)
+        nxt = model_for(c, "worker", spec.get("complexity", "medium"), st.get("rounds", 0) + 1)
+        set_state(tid, "queued", rounds=st.get("rounds", 0) + 1, red_rounds=0); print(f"↺ {tid}: reviewer REJECT, rework round {st.get('rounds',0)+1} -> {nxt}")
+    else:
+        set_state(tid, "needs_human", last_verdict=review.get("verdict")); print(f"● {tid}: waiting for you  [{review.get('risk')}] {review['verdict']}")
+
+def tick(c):
+    running = 0
+    for tid, spec, st in all_tasks():
+        if st["state"] == "running":
+            alive = pid_alive(st["pid"])
+            age = (datetime.now(timezone.utc) - datetime.strptime(st["started"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds() / 60
+            if alive and age > c["worker_timeout_min"]:
+                try: os.killpg(st["pid"], 15)
+                except Exception: pass
+                print(f"⏱ {tid}: killed after {int(age)} min"); alive = False
+            if alive: running += 1
+            else: reap(c, tid, spec, st)
+    for tid, spec, st in all_tasks():
+        if running >= c["max_workers"]: break
+        if st["state"] == "queued" and deps_ok(spec):
+            try: start_worker(c, tid, spec, st); running += 1
+            except Exception as e: set_state(tid, "failed", reason=str(e)); print(f"✗ {tid}: {e}")
+
+def cmd_run(_): tick(cfg())
+def cmd_loop(args):
+    every = int(args[args.index("--every") + 1]) if "--every" in args else 120
+    ok, detail = account_status(cfg())
+    if not ok: die(f"forge is not signed in to Claude ({detail}); forge login first")
+    print(f"forge v{VERSION} loop; agents run as: {detail}", flush=True)
+    (ROOT / "logs" / "loop.version").write_text(f"{VERSION} {os.getpid()} {now()}")
+    while True:
+        tick(cfg()); time.sleep(every)
+
+# ---------------------------------------------------------------- owner steps: run, diagnose, record (no copy-paste from anyone)
+
+import glob as _glob
+import xml.etree.ElementTree as _ET
+
+def scrub(c, text):
+    """What leaves the machine or lands in the repo: redaction terms, plus any value that looks like a credential."""
+    text = redact(c, text or "")
+    for k, v in os.environ.items():
+        if SECRET_ENV.search(k) and v and len(v) >= 8: text = text.replace(v, "***")
+    text = re.sub(r"(?i)\b([a-z0-9_]*(?:api[_-]?key|token|secret|password)[a-z0-9_]*)\s*[=:]\s*\S+", r"\1=***", text)
+    return text
+
+def adb_path():
+    p = shutil.which("adb")
+    if p: return p
+    for cand in [Path.home() / "Library/Android/sdk/platform-tools/adb", Path.home() / "Android/Sdk/platform-tools/adb"]:
+        if cand.exists(): return str(cand)
+    return None
+
+DOCTOR_CHECKS = {}
+def doctor_check(name):
+    def wrap(fn): DOCTOR_CHECKS[name] = fn; return fn
+    return wrap
+
+@doctor_check("tools")
+def _d_tools(c, ctx):
+    out = []
+    for tool, fix in (("claude", "install Claude Code and sign in"), ("git", "install Xcode command line tools"), ("gh", "brew install gh && gh auth login")):
+        out.append((bool(shutil.which(tool)), f"{tool} on PATH", fix))
+    return out
+
+@doctor_check("account")
+def _d_account(c, ctx):
+    ok, detail = account_status(c)
+    return [(ok, f"forge signed in to Claude ({detail})" if ok else "forge signed in to Claude", "forge login")]
+
+@doctor_check("loop")
+def _d_loop(c, ctx):
+    r = subprocess.run(["pgrep", "-f", "forge loop"], capture_output=True, text=True)
+    alive = bool(r.stdout.strip())
+    return [(alive, "forge loop running", "start it in its own terminal: forge loop")]
+
+@doctor_check("repos")
+def _d_repos(c, ctx):
+    out = []
+    for name, path in repos(c).items():
+        p = Path(path); ok = (p / ".git").exists()
+        cur = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=p, check=False).stdout.strip() if ok else ""
+        dirty = bool(sh(["git", "status", "--porcelain"], cwd=p, check=False).stdout.strip()) if ok else False
+        out.append((ok, f"repo {name} at {path}", "fix the path in forge.json repos"))
+        if ok: out.append((cur == c["base_branch"] and not dirty, f"repo {name} on {c['base_branch']} and clean (is: {cur}{', dirty' if dirty else ''})", f"git -C {path} checkout {c['base_branch']} and commit or stash your changes"))
+    return out
+
+@doctor_check("android_device")
+def _d_android(c, ctx):
+    adb = adb_path()
+    if not adb: return [(False, "adb found", "install Android platform-tools, or export PATH=\"$HOME/Library/Android/sdk/platform-tools:$PATH\"")]
+    r = subprocess.run([adb, "devices"], capture_output=True, text=True)
+    rows = [l.split() for l in r.stdout.splitlines()[1:] if l.strip()]
+    ready = [d for d in rows if len(d) > 1 and d[1] == "device"]
+    unauth = [d for d in rows if len(d) > 1 and d[1] == "unauthorized"]
+    out = [(bool(shutil.which("adb")) or True, f"adb at {adb}", "")]
+    if unauth: out.append((False, f"device {unauth[0][0]} authorised", "unlock the phone and accept the 'Allow USB debugging' prompt (tick always allow), then replug"))
+    elif not rows: out.append((False, "a device attached", "plug the phone in with USB debugging on; charge-only cables and 'charging only' USB mode show nothing"))
+    elif len(ready) != 1: out.append((False, f"exactly one device ready (have {len(ready)})", "disconnect the others or stop the emulator"))
+    else: out.append((True, f"device {ready[0][0]} ready", ""))
+    ctx["adb"] = adb; ctx["device"] = ready[0][0] if len(ready) == 1 else None
+    return out
+
+@doctor_check("local_server")
+def _d_server(c, ctx):
+    url = ctx.get("base_url") or "http://127.0.0.1:8080"
+    probe = url.rstrip("/") + "/health"
+    r = subprocess.run(["curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", probe], capture_output=True, text=True)
+    out = [(r.stdout.strip() == "200", f"server answers {probe} from this machine", "start the server in its own terminal and wait for it to answer")]
+    if "127.0.0.1" in url or "localhost" in url:
+        adb = ctx.get("adb") or adb_path()
+        if adb:
+            rv = subprocess.run([adb, "reverse", "--list"], capture_output=True, text=True).stdout
+            port = re.search(r":(\d+)", url.split("//", 1)[-1]); port = port.group(1) if port else "8080"
+            out.append((f"tcp:{port}" in rv, f"adb reverse tcp:{port} in place", f"adb reverse tcp:{port} tcp:{port}   (dies when the phone reconnects; owner run re-applies it)"))
+    return out
+
+@doctor_check("docker")
+def _d_docker(c, ctx):
+    r = subprocess.run(["docker", "ps"], capture_output=True, text=True) if shutil.which("docker") else None
+    return [(bool(r and r.returncode == 0), "docker daemon running", "start Docker Desktop")]
+
+def run_doctor(c, names, ctx=None, quiet=False):
+    ctx = ctx if ctx is not None else {}
+    failed = []
+    for n in names:
+        fn = DOCTOR_CHECKS.get(n)
+        if not fn: print(f"doctor: unknown check '{n}' (have {', '.join(DOCTOR_CHECKS)})"); continue
+        for ok, what, fix in fn(c, ctx):
+            if not quiet or not ok: print(f"  {'ok  ' if ok else 'FAIL'} {what}" + (f"\n       fix: {fix}" if not ok and fix else ""))
+            if not ok: failed.append(what)
+    return failed, ctx
+
+def cmd_doctor(args):
+    """forge doctor [check ...]: environment preflight with a fix per failure. Default: tools, loop, repos (+ android_device, local_server, docker when named)."""
+    c = cfg(); names = [a for a in args if not a.startswith("-")] or ["tools", "account", "loop", "repos"]
+    ctx = {"base_url": args[args.index("--base-url") + 1]} if "--base-url" in args else {}
+    failed, _ = run_doctor(c, names, ctx)
+    print("doctor: all good" if not failed else f"doctor: {len(failed)} problem(s) above")
+    if failed: sys.exit(1)
+
+# ---- JUnit evidence
+
+def parse_junit(paths):
+    """{classname: {"tests": n, "failed": [(name, first line of message)]}} over every testcase in the given XML files."""
+    out = {}
+    for p in paths:
+        try: root = _ET.parse(p).getroot()
+        except Exception: continue
+        for tc in root.iter("testcase"):
+            cls = tc.get("classname") or "?"; name = tc.get("name") or "?"
+            d = out.setdefault(cls, {"tests": 0, "failed": []}); d["tests"] += 1
+            f = tc.find("failure") if tc.find("failure") is not None else tc.find("error")
+            if f is not None: d["failed"].append((name, (f.get("message") or (f.text or "")).strip().splitlines()[0][:200] if (f.get("message") or f.text) else "failed"))
+    return out
+
+def evaluate_checks(checks, junit):
+    """Each check names test classes (suffix match on the simple name is fine). Returns [(ac, ok, detail)]."""
+    def find(cls): return [k for k in junit if k == cls or k.endswith("." + cls) or k.endswith(cls)]
+    res = []
+    for ch in checks:
+        ac = ch.get("ac") or ch.get("name") or "check"; problems = []
+        for cls in ch.get("must_pass", []):
+            ks = find(cls)
+            if not ks: problems.append(f"{cls} did not run")
+            for k in ks:
+                for n, m in junit[k]["failed"]: problems.append(f"{k}.{n}: {m}")
+        for cls in ch.get("must_not_run", []):
+            if find(cls): problems.append(f"{cls} ran (it must be excluded from this run)")
+        for cls in ch.get("may_fail", []): pass
+        if ch.get("min_tests") and sum(v["tests"] for v in junit.values()) < ch["min_tests"]: problems.append(f"only {sum(v['tests'] for v in junit.values())} test(s) ran, expected at least {ch['min_tests']}")
+        if problems: detail = "; ".join(problems)
+        else:
+            parts = [f"{k.rsplit('.',1)[-1]} {junit[k]['tests']} ok" for cls in ch.get("must_pass", []) for k in find(cls)]
+            parts += [f"{cls} absent" for cls in ch.get("must_not_run", [])]
+            detail = ", ".join(parts) or "ok"
+        res.append((ac, not problems, detail))
+    return res
+
+# ---- what the failure shapes we have met mean
+
+DIAGNOSES = [
+    (r"no devices/emulators found|No connected devices|DeviceException", "no device", "The phone is not attached or not authorised. Plug it in, unlock it, accept the USB debugging prompt; forge doctor android_device.", None),
+    (r"Device is UNAUTHORIZED", "device unauthorised", "Accept the 'Allow USB debugging' prompt on the phone (tick always allow) and replug.", None),
+    (r"tests=\"0\"|ZERO_TESTS", "no tests ran", "A runner filter matched nothing: annotation and notAnnotation intersect, the lift flag the build defines for opt-in tests is missing, or the class name is wrong.", None),
+    (r"AbstractMethodError|NoSuchMethodError|IncompatibleClassChangeError", "binary mismatch on the device classpath", "A library on the instrumented classpath was compiled against a newer dependency than the one resolved (version skew). Align the production version and let consistent resolution carry it.", "build"),
+    (r"CLEARTEXT communication .* not permitted", "cleartext blocked", "Android forbids plain http to non-localhost on API 28+; the debug build needs a network security config that permits cleartext (debug only).", "build"),
+    (r"SocketTimeoutException|failed to connect to /\d+\.\d+\.\d+\.\d+", "no TCP path to the server", "The phone reaches the host for ping but not the port: client isolation or a firewall. Use the USB tunnel: adb reverse tcp:8080 tcp:8080 and base URL http://127.0.0.1:8080.", None),
+    (r"Connection refused|ECONNREFUSED", "server not listening", "Nothing is listening at the base URL. Start the server and check forge doctor local_server.", None),
+    (r"Could not resolve all files for configuration|Cannot find a version of .* that satisfies", "dependency conflict at configuration time", "Two configurations want different versions of the same artifact (consistent resolution vs a direct pin). The production classpath must request the newer version.", "build"),
+    (r"Cannot find the schema file in the assets folder", "Room schema not in androidTest assets", "Add sourceSets androidTest assets.srcDirs(files(\"$projectDir/schemas\")) in the app module.", "build"),
+    (r"INSTALL_FAILED|Failed to install", "APK did not install", "Uninstall the app on the phone (adb uninstall <applicationId>) and rerun.", None),
+]
+
+def diagnose(text):
+    hits = []
+    for rx, title, hint, kind in DIAGNOSES:
+        if re.search(rx, text): hits.append((title, hint, kind))
+    return hits
+
+# ---- the command
+
+def owner_env(c, spec, base_url):
+    env = dict(os.environ); env["BASE_URL"] = base_url; env["FORGE_TASK"] = spec["id"]
+    adb = adb_path()
+    if adb and str(Path(adb).parent) not in env.get("PATH", ""): env["PATH"] = str(Path(adb).parent) + os.pathsep + env.get("PATH", "")
+    return env
+
+WORK_VERBS = re.compile(r"\b(open|compute|calculate|write|paste|edit|run|copy|record the|count the|note the p50)\b", re.I)
+
+def device_logcat(rpath, tag_prefix=None):
+    """What the app said on the device: its own tags plus crashes and media-session routing lines."""
+    adb = adb_path()
+    if not adb: return ""
+    tag_prefix = tag_prefix or cfg().get("log_tag") or "app"
+    r = subprocess.run([adb, "logcat", "-d", "-v", "time"], capture_output=True, text=True)
+    keep = re.compile(rf"{tag_prefix}|AndroidRuntime|MediaSessionService|MediaButtonReceiver|MediaSession|AudioFocus|KEYCODE_MEDIA|KeyEvent|TestRunner|Process crashed|INSTRUMENTATION_", re.I)
+    return "\n".join(l for l in r.stdout.splitlines() if keep.search(l))[-200000:]
+
+def media_session_dump():
+    """dumpsys media_session: who holds the media-button session and which packages have a session at all."""
+    adb = adb_path()
+    if not adb: return ""
+    r = subprocess.run([adb, "shell", "dumpsys", "media_session"], capture_output=True, text=True)
+    return r.stdout
+
+def media_session_facts(dump):
+    """{'button': pkg or None, 'sessions': {pkg: {'active': bool, 'state': str}}, 'playing': [pkg]} from a dumpsys media_session text."""
+    f = {"button": None, "sessions": {}, "playing": []}
+    m = re.search(r"Media button session is ([\w.]+)/", dump)
+    if m and m.group(1) != "null": f["button"] = m.group(1)
+    stack = dump.split("Sessions Stack", 1)[1] if "Sessions Stack" in dump else ""
+    stack = stack.split("Record for full_user", 1)[0]
+    for blk in re.split(r"\n    (?=\S)", stack)[1:]:
+        pkg = re.search(r"package=(\S+)", blk); act = re.search(r"active=(\w+)", blk); st = re.search(r"state=PlaybackState \{state=(\w+)", blk)
+        if pkg: f["sessions"][pkg.group(1)] = {"active": bool(act and act.group(1) == "true"), "state": st.group(1) if st else "none"}
+    ap = dump.split("Audio playback", 1)[1].split("\n\n", 1)[0] if "Audio playback" in dump else ""
+    f["playing"] = re.findall(r"packages=(\S+)", ap)
+    return f
+
+def script_order_problems(orun):
+    """A device test that runs before the app is launched or permitted cannot pass; say so and propose the order."""
+    steps = orun.get("steps", [])
+    tests = [i for i, st in enumerate(steps, 1) if "run" in st and re.search(SOURCESET_RUNNERS["androidTest"][0], st["run"])]
+    setup = [i for i, st in enumerate(steps, 1) if ("run" in st and re.search(r"\bam start\b|\bpm grant\b|appops set", st["run"])) or ("prompt" in st and re.search(r"\b(allow|permission|grant)\b", st["prompt"], re.I))]
+    late = [i for i in setup if tests and i > tests[0]]
+    return tests[0] if late else None, late
+
+def stats_from_file(path, pattern):
+    try: vals = sorted(float(m) for m in re.findall(pattern, Path(path).read_text()))
+    except Exception: return None
+    if not vals: return {"n": 0}
+    q = lambda f: vals[min(len(vals) - 1, int(round(f * (len(vals) - 1))))]
+    return {"n": len(vals), "p50": q(0.5), "p95": q(0.95), "min": vals[0], "max": vals[-1]}
+
+def run_step_logged(cmd, cwd, env, log, ignore_exit=False):
+    """Run one owner step with output streamed to the terminal and the log. Returns (returncode, text)."""
+    print(f"$ {cmd}", flush=True); log.write(f"\n$ {cmd}\n"); log.flush()
+    p = subprocess.Popen(cmd, shell=True, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    buf = []
+    for line in p.stdout:
+        sys.stdout.write(line); buf.append(line); log.write(line)
+    p.wait(); log.flush()
+    return p.returncode, "".join(buf)
+
+SOURCESET_RUNNERS = {   # how a Gradle source set's tests get run, and where their JUnit XML lands
+    "androidTest": (r"connected\w*AndroidTest", "**/build/outputs/androidTest-results/connected/**/*.xml"),
+    "test":        (r"(^|\s|:)test(\s|$)|test\w*UnitTest", "**/build/test-results/**/*.xml"),
+}
+
+def locate_test_class(rpath, cls):
+    """[(path, sourceset)] for a test class name (simple or qualified), by grepping the repo's src/ trees."""
+    simple = cls.rsplit(".", 1)[-1]
+    r = subprocess.run(["grep", "-rl", "--include=*.kt", "--include=*.java", "-E", rf"\bclass {simple}\b", "."], cwd=rpath, capture_output=True, text=True)
+    out = []
+    for f in r.stdout.split():
+        m = re.search(r"/src/([^/]+)/", f)
+        out.append((f.lstrip("./"), m.group(1) if m else "?"))
+    return out
+
+def check_owner_script(orun, rpath):
+    """Static check of owner_run against the repo. Returns (problems, fixes): fixes are edits to orun that would make the checks runnable."""
+    problems, fixes = [], []
+    steps = orun.get("steps", [])
+    ev = orun.get("evidence", [])
+    def step_runs(ss):
+        rx = SOURCESET_RUNNERS[ss][0]
+        return [i for i, st in enumerate(steps, 1) if "run" in st and re.search(rx, st["run"])]
+    for ch in orun.get("checks", []):
+        for cls in ch.get("must_pass", []) + ch.get("must_not_run", []):
+            found = locate_test_class(rpath, cls)
+            if not found:
+                problems.append(f"{cls}: no class by that name under src/ in this repo (a worker subtask may not have delivered it, or the plan misnamed it)"); continue
+            ss = next((x for _, x in found if x in SOURCESET_RUNNERS), found[0][1])
+            if ss not in SOURCESET_RUNNERS:
+                problems.append(f"{cls}: lives in src/{ss}, which forge does not know how to run"); continue
+            runners = step_runs(ss)
+            if not runners:
+                problems.append(f"{cls}: is an {ss} test but no step runs {ss} tests")
+                fixes.append(("add_step", ss))
+                if not any(("androidTest-results" in g) == (ss == "androidTest") and ("test-results" in g or "androidTest-results" in g) for g in ev): fixes.append(("evidence", SOURCESET_RUNNERS[ss][1]))
+                continue
+            want = ch.get("step")
+            if want and want not in runners:
+                problems.append(f"{cls}: check says step {want} but that step does not run {ss} tests (steps that do: {runners})")
+                fixes.append(("retarget", ch.get("ac"), runners[-1]))
+            for i in runners:
+                if not steps[i - 1].get("expect_tests"):
+                    problems.append(f"step {i} runs {ss} tests but is not marked expect_tests, so its results would never be read")
+                    fixes.append(("expect_tests", i))
+            glob_needed = SOURCESET_RUNNERS[ss][1]
+            if not any(("androidTest-results" in g) == (ss == "androidTest") and ("test-results" in g or "androidTest-results" in g) for g in ev):
+                problems.append(f"{cls}: evidence globs do not cover {ss} results ({glob_needed})")
+                fixes.append(("evidence", glob_needed))
+    # dedupe fixes preserving order
+    seen = set(); fixes = [f for f in fixes if not (f in seen or seen.add(f))]
+    return problems, fixes
+
+def apply_owner_fixes(orun, fixes):
+    steps = orun.setdefault("steps", []); ev = orun.setdefault("evidence", [])
+    notes = []
+    for f in fixes:
+        if f[0] == "expect_tests": steps[f[1] - 1]["expect_tests"] = True; notes.append(f"step {f[1]} marked expect_tests")
+        elif f[0] == "evidence":
+            if f[1] not in ev: ev.append(f[1]); notes.append(f"evidence += {f[1]}")
+        elif f[0] == "retarget":
+            for ch in orun.get("checks", []):
+                if ch.get("ac") == f[1]: ch["step"] = f[2]; notes.append(f"check '{f[1]}' now judges step {f[2]}")
+        elif f[0] == "reorder":
+            test_i, late = f[1], list(f[2])
+            moved = [steps[i - 1] for i in late]
+            for i in sorted(late, reverse=True): del steps[i - 1]
+            for m in reversed(moved): steps.insert(test_i - 1, m)
+            notes.append(f"steps {late} moved before the device test (now step {test_i + len(late)})")
+            for ch in orun.get("checks", []):
+                if ch.get("step") == test_i: ch["step"] = test_i + len(late)
+        elif f[0] == "drop_prompt":
+            steps[f[1] - 1] = {"note": "dropped by forge: " + steps[f[1] - 1]["prompt"][:120]}; notes.append(f"step {f[1]} prompt dropped (forge reports the measurements itself)")
+        elif f[0] == "add_step":
+            cmd = "./gradlew connectedDebugAndroidTest" if f[1] == "androidTest" else "./gradlew test"
+            steps.append({"run": cmd, "expect_tests": True}); notes.append(f"step {len(steps)} added: {cmd}")
+    return notes
+
+def test_class_facts(rpath, path):
+    """package, fully-qualified name, annotations on the class, from a Kotlin/Java test source."""
+    try: txt = (Path(rpath) / path).read_text()
+    except Exception: return {}
+    pkg = re.search(r"^\s*package\s+([\w.]+)", txt, re.M); pkg = pkg.group(1) if pkg else ""
+    m = re.search(r"((?:^\s*@[\w.]+(?:\([^)]*\))?\s*\n)*)\s*(?:public\s+|internal\s+)?class\s+(\w+)", txt, re.M)
+    anns = re.findall(r"@([\w.]+)", m.group(1)) if m else []
+    name = m.group(2) if m else Path(path).stem
+    return {"package": pkg, "fqcn": f"{pkg}.{name}" if pkg else name, "annotations": anns, "ignored": "Ignore" in anns}
+
+def runner_filters(cmd):
+    f = {}
+    for k in ("class", "notClass", "annotation", "notAnnotation", "package", "notPackage"):
+        m = re.search(rf"testInstrumentationRunnerArguments\.{k}=(\S+)", cmd)
+        if m: f[k] = m.group(1)
+    return f
+
+def build_exclusions(rpath):
+    """notAnnotation set by the build script, and the Gradle property that lifts it, if any."""
+    out = {}
+    for b in Path(rpath).glob("*/build.gradle.kts"):
+        txt = b.read_text()
+        m = re.search(r'testInstrumentationRunnerArguments\["notAnnotation"\]\s*=\s*"([\w.]+)"', txt)
+        if m:
+            out["notAnnotation"] = m.group(1)
+            lift = re.search(r'gradleProperty\("(\w+)"\)', txt[max(0, m.start() - 400):m.start()])
+            if lift: out["lift"] = lift.group(1)
+    return out
+
+def why_class_missing(rpath, orun, cls, path, step_no):
+    """Explain why a class that exists and whose runner step produced XML is absent from that XML. Returns (reason, fix_cmd or None)."""
+    cmd = orun["steps"][step_no - 1]["run"]
+    facts = test_class_facts(rpath, path); filt = runner_filters(cmd); excl = build_exclusions(rpath)
+    fq = facts.get("fqcn", cls); anns = facts.get("annotations", [])
+    if facts.get("ignored"): return (f"{cls} is annotated @Ignore in its source", None)
+    if "class" in filt and fq not in filt["class"].split(","):
+        return (f"step {step_no} filters to class={filt['class']}; {fq} is not in that list", cmd.replace(filt["class"], filt["class"] + "," + fq))
+    if "annotation" in filt and filt["annotation"].rsplit(".", 1)[-1] not in anns:
+        return (f"step {step_no} runs only tests annotated @{filt['annotation'].rsplit('.',1)[-1]}; {cls} carries {anns or 'no annotations'}", None)
+    na = filt.get("notAnnotation") or excl.get("notAnnotation")
+    if na and na.rsplit(".", 1)[-1] in anns:
+        lift = excl.get("lift")
+        fix = cmd + (f" -P{lift}=true" if lift and f"-P{lift}" not in cmd else "")
+        return (f"{cls} is annotated @{na.rsplit('.',1)[-1]}, which the build excludes by default" + (f"; the lift flag is -P{lift}=true" if lift else ""), fix if fix != cmd else None)
+    if "package" in filt and not fq.startswith(filt["package"]):
+        return (f"step {step_no} filters to package={filt['package']}; {fq} is outside it", None)
+    return (f"{cls} compiled into the androidTest APK but the runner did not execute it and no filter explains it: run it alone to see the runner's own message", cmd + f" -Pandroid.testInstrumentationRunnerArguments.class={fq}")
+
+def cmd_owner(args):
+    """forge owner run <id> [--base-url URL] [--dry-run] [--no-post] [--from N]: run an owner step's script, judge the evidence, record it, approve on green."""
+    if len(args) < 2 or args[0] != "run": die("usage: forge owner run <id> [--base-url URL] [--dry-run] [--no-post]")
+    c = cfg(); tid = args[1]; spec = load(tid, "spec.json") or die(f"no task {tid}"); st = load(tid, "state.json") or {}
+    if st.get("state") != "owner": die(f"{tid} is {st.get('state')}, not an owner step")
+    orun = spec.get("owner_run")
+    if not orun:
+        print("This owner step has no runnable script (planned before owner_run existed). Its steps:\n  " + "\n  ".join(spec.get("steps") or ["(none)"]))
+        print(f"Do them, then: forge approve {tid}"); return
+    rname, rpath, _, _ = repo_for(c, spec)
+    base_url = args[args.index("--base-url") + 1] if "--base-url" in args else (orun.get("env", {}).get("BASE_URL") or "http://127.0.0.1:8080")
+    dry = "--dry-run" in args
+    print(f"owner step {tid} in {rname} ({rpath}); BASE_URL={base_url}")
+    problems, fixes = check_owner_script(orun, rpath)
+    first_test, late_setup = script_order_problems(orun)
+    if late_setup:
+        problems.append(f"the device test at step {first_test} runs before the app is launched/permitted at step(s) {late_setup}; a test that waits for the running app will time out")
+        fixes.append(("reorder", first_test, tuple(late_setup)))
+    for i, st in enumerate(orun.get("steps", []), 1):
+        if "prompt" in st and WORK_VERBS.search(st["prompt"]) and not re.search(r"\b(press|plug|lock|unlock|say|speak|start a playlist|put on|wear|tap|hold)\b", st["prompt"], re.I):
+            problems.append(f"step {i} is a prompt that asks you to do work ({st['prompt'][:60]}…); prompts are for physical actions only, forge or a worker does the rest")
+            fixes.append(("drop_prompt", i))
+    if problems:
+        print("script check: the plan's owner_run cannot prove its own checks as written:")
+        for pr in problems: print("  - " + pr)
+        if fixes:
+            print("forge can amend this task's script:")
+            for n in apply_owner_fixes(json.loads(json.dumps(orun)), fixes): print("  + " + n)
+            if not sys.stdin.isatty() or input("apply these amendments and continue? [Y/n] ").strip().lower() in ("", "y"):
+                notes = apply_owner_fixes(orun, fixes); spec["owner_run"] = orun; save(tid, "spec.json", spec)
+                round_log(tid, outcome="owner_script_amended", notes=notes); print("amended; continuing")
+            else: die("not amended; fix the plan (forge plan show " + str(spec.get("ticket")) + ") or the task's spec.json and run again")
+        else: die("no automatic fix for the above; the missing classes have to be delivered by a worker first (forge status shows which subtasks are not approved)")
+    ctx = {"base_url": base_url}
+    pre = orun.get("preflight") or []
+    if pre:
+        print("preflight:"); failed, ctx = run_doctor(c, pre, ctx)
+        if failed: die("preflight failed; fix the lines above and run again")
+    log_path = task_dir(tid) / "owner-run.log"; log = open(log_path, "a"); log.write(f"\n==== owner run {now()} base_url={base_url}\n")
+    env = owner_env(c, spec, base_url)
+    outputs = []; stopped_at = None; per_step = {}; observations = []; stats_out = []; logcats = {}   # step number -> parsed junit for that run (evidence dirs get overwritten between runs)
+    start = int(args[args.index("--from") + 1]) if "--from" in args else 1
+    ev_dir = task_dir(tid) / "evidence"
+    if start > 1 and ev_dir.exists():
+        for d in sorted(ev_dir.glob("step-*")):
+            n = int(d.name.split("-")[1])
+            if n < start: per_step[n] = parse_junit([str(x) for x in d.glob("*.xml")])
+        print(f"resuming from step {start}; keeping evidence of steps {sorted(per_step)}")
+    else:
+        shutil.rmtree(ev_dir, ignore_errors=True); ev_dir.mkdir()
+    def snapshot(i):
+        files = [p for g in orun.get("evidence", []) for p in _glob.glob(str(Path(rpath) / g), recursive=True)]
+        per_step[i] = parse_junit(files)
+        d = ev_dir / f"step-{i}"; d.mkdir(exist_ok=True)
+        for p in files:
+            try: shutil.copy(p, d / Path(p).name)
+            except Exception: pass
+    for i, step in enumerate(orun.get("steps", []), 1):
+        if i < start: continue
+        if "note" in step: continue
+        if "prompt" in step or "ask" in step:
+            q = step.get("prompt") or step.get("ask")
+            try: ans = input(f"\n[{i}] {q}  — " + ("type what you observed, or Enter if as expected > " if "prompt" in step else "answer > ")).strip()
+            except EOFError: ans = ""; print("(no terminal; continuing)")
+            log.write(f"\n[{i}] {q}\n    owner: {ans or '(as expected)'}\n")
+            if ans: observations.append((i, q, ans))
+            continue
+        if "stats" in step:
+            sp = step["stats"]; res = stats_from_file(Path(rpath) / sp["file"], sp["pattern"])
+            stats_out.append((sp.get("name") or sp["file"], res)); print(f"[{i}] {sp.get('name') or sp['file']}: {res}"); continue
+        cmd = step["run"].replace("{BASE_URL}", base_url)
+        if dry: print(f"[{i}] would run: {cmd}"); continue
+        if step.get("expect_tests"):
+            for g in orun.get("evidence", []):   # stale XML from a previous run must not count as this step's evidence
+                for p in _glob.glob(str(Path(rpath) / g), recursive=True):
+                    try: os.remove(p)
+                    except Exception: pass
+        rc, text = run_step_logged(cmd, rpath, env, log, step.get("ignore_exit", False))
+        outputs.append(text)
+        if step.get("expect_tests"):
+            snapshot(i)
+            if re.search(SOURCESET_RUNNERS["androidTest"][0], cmd):
+                lc = device_logcat(rpath); logcats[i] = lc; (ev_dir / f"logcat-step-{i}.txt").write_text(scrub(c, lc))
+                ms = media_session_dump()
+                if ms: (ev_dir / f"media_session-step-{i}.txt").write_text(scrub(c, ms))
+        if rc != 0 and not step.get("ignore_exit") and not step.get("expect_tests"):
+            stopped_at = (i, cmd, rc); break
+    log.close()
+    if dry: return
+    last = max(per_step) if per_step else None
+    def junit_for(ch):
+        n = ch.get("step", last)
+        return per_step.get(n, {})
+    results = []
+    for ch in orun.get("checks", []): results += evaluate_checks([ch], junit_for(ch))
+    junit = {}
+    for n in sorted(per_step): junit.update({f"step{n}:{k}": v for k, v in per_step[n].items()})
+    total = sum(v["tests"] for v in junit.values())
+    all_text = "\n".join(outputs) + ("\nZERO_TESTS" if per_step and any(sum(v["tests"] for v in j.values()) == 0 for j in per_step.values()) else "")
+    diag = diagnose(all_text + "\n" + "\n".join(m for v in junit.values() for _, m in v["failed"]))
+    obs_text = " ".join(a for _, _, a in observations).lower()
+    if observations and re.search(r"pause|stopp?ed|skip|nothing happen|no reply|didn.?t hear", obs_text):
+        diag.append(("media button routed to another app", "The press changed the music app's state and the app saw no key: Android delivers media buttons to the most recently active MediaSession in a PLAYING state. The app's session must report PLAYING with a position and speed while the service runs, and must have been the last to play; a merely active session loses to the music app. Code defect in the media-session subtask.", "build"))
+    if any(re.search(r"timed out waiting for the prototype|waiting for the app|prototype .* route", m, re.I) for v in junit.values() for _, m in v["failed"]):
+        diag.append(("device test ran before the app was ready", "The instrumented test waits for the running app to reach a state (routing buttons) that only happens after launch and permission; either the test must launch and permit the app itself, or the script must launch it first. forge reorders the script when launch/permission steps come after the test.", None))
+    ok = not stopped_at and all(r[1] for r in results) and (total > 0 or not orun.get("evidence"))
+    final_lc = device_logcat(rpath) if adb_path() and any(re.search(SOURCESET_RUNNERS["androidTest"][0], st.get("run", "")) for st in orun.get("steps", [])) else ""
+    if final_lc: (ev_dir / "logcat-final.txt").write_text(scrub(c, final_lc))
+    final_ms = media_session_dump() if final_lc else ""
+    if final_ms: (ev_dir / "media_session-final.txt").write_text(scrub(c, final_ms))
+    app_pkg = None
+    try: app_pkg = re.search(r'applicationId\s*=\s*"([\w.]+)"', (Path(rpath) / "app" / "build.gradle.kts").read_text()).group(1)
+    except Exception: pass
+    lines = [f"# owner run {tid}", f"when: {now()}  repo: {rname}  base_url: {base_url}  result: {'PASS' if ok else 'FAIL'}", ""]
+    if observations: lines += ["## what the owner observed"] + [f"- step {i}: {q[:80]} → {a}" for i, q, a in observations] + [""]
+    if stats_out: lines += ["## measurements"] + [f"- {n}: " + ("no samples" if not r or r.get("n") == 0 else f"n={r['n']} p50={r['p50']:.0f} p95={r['p95']:.0f} min={r['min']:.0f} max={r['max']:.0f}") for n, r in stats_out] + [""]
+    if final_lc:
+        btn = [l for l in final_lc.splitlines() if re.search(rf"{re.escape(c.get('log_tag') or 'app')}\.button|KEYCODE_MEDIA", l)]
+        crash = [l for l in final_lc.splitlines() if "AndroidRuntime" in l and "FATAL" in l]
+        sess = [l for l in final_lc.splitlines() if re.search(r"MediaSessionService|MediaButtonReceiver", l)][-8:]
+        targets = re.findall(r"targetPackage:(\S+)", final_lc)
+        tr_started = re.findall(r"TestRunner: started: (\S+)\((\S+)\)", final_lc); tr_fin = re.findall(r"TestRunner: finished: (\S+)", final_lc); tr_crash = [l for l in final_lc.splitlines() if re.search(r"Process crashed|INSTRUMENTATION_(ABORTED|FAILED)|TestRunner: failed", l)]
+        lines += ["## device log (evidence/logcat-final.txt)", f"- media key lines seen by the app: {len(btn)}" + ("" if btn else " — no press reached the app's receiver"), f"- app crashes: {len(crash)}"] + ([f"  - {l[:160]}" for l in crash[:3]])
+        if targets:
+            counts = {t: targets.count(t) for t in set(targets)}
+            lines.append("- media buttons delivered by the system to: " + ", ".join(f"{t} ({n})" for t, n in sorted(counts.items(), key=lambda x: -x[1])) + (f" — never to {app_pkg}" if app_pkg and app_pkg not in counts else ""))
+            if app_pkg and app_pkg not in counts: diag.append(("media buttons owned by another app", f"MediaSessionService routed every press to {max(counts, key=counts.get)}; {app_pkg}'s session was never the target. The app's MediaSession must be the last session to report PLAYING (with position and playback speed) and be active while the service runs; a merely-active session loses to the music app. Code defect in the media-session subtask.", "build"))
+        if tr_started: lines.append(f"- instrumentation: {len(tr_started)} test(s) started, {len(tr_fin)} finished" + (f"; aborted: {tr_crash[0][:140]}" if tr_crash else ""))
+        if tr_crash and not any(t == "instrumentation aborted" for t, _, _ in diag): diag.append(("instrumentation aborted", "The test process stopped before the remaining classes ran (crash or runner abort); the classes reported as 'did not run' are a consequence, not separate failures. Fix the first failure.", None))
+        lines += ([f"- last routing lines: "] + [f"  - {l[:160]}" for l in sess] if sess else []) + [""]
+    if final_ms:
+        mf = media_session_facts(final_ms)
+        lines += ["## media sessions at the end of the run (evidence/media_session-final.txt)", f"- media button session: {mf['button'] or 'none'}",
+                  "- sessions registered: " + (", ".join(f"{k} ({'active' if v['active'] else 'inactive'}, {v['state']})" for k, v in mf["sessions"].items()) or "none"),
+                  "- audio playback, most recent first: " + (", ".join(mf["playing"]) or "none"), ""]
+        if app_pkg and app_pkg not in mf["sessions"]:
+            diag = [d for d in diag if d[0] not in ("media buttons owned by another app", "media button routed to another app")]
+            diag.append(("app has no MediaSession", f"dumpsys media_session lists no session for {app_pkg} at all (registered: {', '.join(mf['sessions']) or 'none'}). This is not a routing contest: the app's foreground service or MediaSession is not alive at this point (never started, released on lock, or killed). Fix in the media-session subtask: the service must be started as a foreground service when the session begins and keep its session active and PLAYING until the session ends; prove it with an instrumented test that locks the screen and asserts the session is still listed by MediaSessionManager.getActiveSessions or that a media key is delivered.", "build"))
+        elif app_pkg and mf["button"] and mf["button"] != app_pkg:
+            st = mf["sessions"][app_pkg]
+            diag = [d for d in diag if d[0] != "media button routed to another app"]
+            diag.append(("app's session loses the media button", f"{app_pkg} has a session ({'active' if st['active'] else 'INACTIVE'}, state {st['state']}) but {mf['button']} holds the media button. Android gives the button to the most recent session that is active and in a playing state. " + ("The app's session is not active: setActive(true) is missing or undone. " if not st["active"] else "") + ("The app's session is not PLAYING: without keep-alive playback and a PLAYING PlaybackState it cannot win against the music app. " if st["state"] != "PLAYING" else "Both are PLAYING; the music app played more recently. This is a design choice for the owner: own the button (restart keep-alive playback after every cue) or use a trigger that does not compete with the music app."), "build"))
+    if stopped_at: lines.append(f"stopped at step {stopped_at[0]} (exit {stopped_at[2]}): {stopped_at[1]}")
+    lines += ["## acceptance"] + [f"- {ac}: {'pass' if good else 'FAIL'} — {detail}" for ac, good, detail in results]
+    lines += ["", "## tests", f"{total} test(s) in {len(junit)} class(es)"] + [f"- {k}: {v['tests']} run, {len(v['failed'])} failed" + ("".join(f"\n    - {n}: {m}" for n, m in v["failed"])) for k, v in sorted(junit.items())]
+    if diag: lines += ["", "## diagnosis"] + [f"- {t}: {h}" for t, h, _ in diag]
+    report = scrub(c, "\n".join(lines)); (task_dir(tid) / "owner-run.md").write_text(report)
+    print("\n" + report)
+    round_log(tid, round=st.get("rounds", 0), outcome="owner_run_pass" if ok else "owner_run_fail", tests=total, checks=[(a, g) for a, g, _ in results], diagnosis=[t for t, _, _ in diag])
+    key = spec.get("jira")
+    if ok:
+        set_state(tid, "approved", committed=now(), owner_run=now())
+        if key and "--no-post" not in args: jira_comment(c, key, f"{spec['id']}: owner run PASS\n" + "\n".join(f"- {ac}: pass — {d}" for ac, _, d in results))
+        print(f"\n{tid} approved on evidence (tasks/{tid}/owner-run.md, evidence/)")
+        return
+    print(f"\n{tid} stays owner; nothing approved.")
+    missing = [(ac, d) for ac, g, d in results if not g and "did not run" in d]
+    if missing:
+        print("why tests did not run:"); proposed = {}
+        for ac, d in missing:
+            for cls in re.findall(r"(\S+) did not run", d):
+                found = locate_test_class(rpath, cls)
+                if not found: print(f"  - {cls}: not in the repo; the worker subtask that owns it has not delivered (see forge status)"); continue
+                ss = found[0][1]; ran = [n for n, j in per_step.items() if any(k.endswith(cls) for k in j)]
+                if ran: print(f"  - {cls} ({ss}): ran in step {ran} but the check judges another step; set the check's step"); continue
+                rx = SOURCESET_RUNNERS.get(ss, ("$^", ""))[0]
+                runners = [n for n, stp in enumerate(orun.get("steps", []), 1) if "run" in stp and re.search(rx, stp["run"])]
+                if not runners: print(f"  - {cls} is in src/{ss} ({found[0][0]}); no step runs {ss} tests"); continue
+                stp = runners[-1]
+                if stp not in per_step or not per_step[stp]:
+                    print(f"  - {cls} is in src/{ss}; step {stp} produced no readable XML: check expect_tests and that evidence covers {SOURCESET_RUNNERS[ss][1]}"); continue
+                reason, fix = why_class_missing(rpath, orun, cls, found[0][0], stp)
+                print(f"  - {reason}")
+                if fix: proposed.setdefault(stp, set()).add(fix)
+        if proposed:
+            stp = sorted(proposed)[0]; cmds = sorted(proposed[stp])
+            new_cmd = cmds[0] if len(cmds) == 1 else None
+            if new_cmd is None:   # several classes each needing a class filter: merge them into one explicit list
+                fqs = sorted({m for c_ in cmds for m in re.findall(r"class=([\w.,]+)", c_) for m in m.split(",")})
+                base = re.sub(r"\s-Pandroid\.testInstrumentationRunnerArguments\.class=\S+", "", cmds[0])
+                new_cmd = base + " -Pandroid.testInstrumentationRunnerArguments.class=" + ",".join(fqs)
+            print(f"\nproposed: step {stp} becomes\n  {new_cmd}")
+            if "--yes" in args or (sys.stdin.isatty() and input(f"apply and rerun from step {stp} now? [Y/n] ").strip().lower() in ("", "y")):
+                orun["steps"][stp - 1]["run"] = new_cmd; spec["owner_run"] = orun; save(tid, "spec.json", spec)
+                round_log(tid, outcome="owner_script_amended", notes=[f"step {stp}: {new_cmd}"])
+                rest = []; skip = False
+                for a in args[2:]:
+                    if skip: skip = False; continue
+                    if a == "--from": skip = True; continue
+                    rest.append(a)
+                return cmd_owner(["run", tid, "--from", str(stp)] + rest)
+        nxt = min((n for n, stp in enumerate(orun.get("steps", []), 1) if "run" in stp and re.search(SOURCESET_RUNNERS["androidTest"][0], stp["run"])), default=None)
+        print(f"after fixing, rerun only the device part: forge owner run {tid} --from {nxt}" if nxt else f"rerun: forge owner run {tid}")
+        return
+    code_defect = [d for d in diag if d[2] == "build"]
+    if code_defect:
+        culprit = orun.get("defect_in") or ""
+        reason = f"Owner run of {spec['id']} failed: " + "; ".join(f"{ac}: {d}" for ac, g, d in results if not g) + ". Diagnosis: " + "; ".join(f"{t} ({h})" for t, h, _ in code_defect)
+        cmd = f"forge plan extend {key} {shlex.quote(reason[:900])}" + (f" --defect-in {culprit}" if culprit else "")
+        print("\nThis looks like a code defect. Hand it back:\n  " + cmd)
+        if sys.stdin.isatty() and input("run that now? [y/N] ").strip().lower() == "y": cmd_plan(["extend", key, reason[:900]] + (["--defect-in", culprit] if culprit else []))
+    else:
+        print("This looks like environment, not code: fix the diagnosis above and run `forge owner run " + tid + "` again.")
+
+# ---------------------------------------------------------------- audit: what happened on a ticket, written into the repo when it closes
+
+def render_audit(c, key):
+    rows = [(t, s, st) for t, s, st in all_tasks() if s.get("jira") == key]
+    plan = {}
+    try: plan = read_plan(c, key)
+    except Exception: pass
+    order = {st["id"]: i for i, st in enumerate(plan.get("subtasks", []))}
+    rows.sort(key=lambda r: order.get(r[0].split("--", 1)[-1], 999))
+    r = load_refine(c, key) or {}
+    L = [f"# forge audit — {key}: {plan.get('title') or ''}", "", f"generated {now()} by forge; every commit below was made by the owner, agents only proposed diffs.", ""]
+    L += ["## refinement", f"- rounds: {r.get('_runs', '?')}; verdict {r.get('verdict', '?')}; accepted {r.get('_accepted_at', '?')}"]
+    for q in r.get("questions", []): L.append(f"- Q{q.get('n')} ({q.get('to')}): {q.get('question')} — {'answered ' + str(q.get('_answered')) if q.get('_answered') else 'open'}")
+    L += ["", "## plan", f"- status {plan.get('_status')}; {len(plan.get('subtasks', []))} subtask(s); {len(plan.get('_extensions', []))} extension(s) after merge"]
+    for e in plan.get("_extensions", []): L.append(f"- extension {e.get('t')}: added {', '.join(e.get('added', []))} — defect: {e.get('defect', '')[:300]}")
+    L += ["", "## subtasks (plan order)"]
+    total_cost = 0.0
+    for tid, s, st in rows:
+        rl = st.get("round_log", [])
+        cost = task_cost(tid); total_cost += cost
+        models = [x.get("model") for x in rl if x.get("model")]
+        verdicts = [x.get("verdict") or x.get("outcome") for x in rl if x.get("verdict") or x.get("outcome")]
+        fa = any(x.get("false_accept") for x in rl)
+        L.append(f"### {tid}")
+        L.append(f"- goal: {s.get('goal')}")
+        L.append(f"- complexity {s.get('complexity')}; models {', '.join(dict.fromkeys(m for m in models if m)) or ('owner' if s.get('owner') else '?')}; rework rounds {st.get('rounds', 0)}; red rounds {st.get('red_rounds', 0)}; notional cost ${cost:.2f}")
+        L.append(f"- outcome: {st.get('state')}; verdict trail: {' → '.join(v for v in verdicts if v) or '-'}" + ("; FALSE ACCEPT recorded" if fa else ""))
+        for x in rl:
+            if x.get("outcome") == "human_rejected": L.append(f"- rejected by owner [{x.get('tag')}]: {x.get('reason', '')[:200]}")
+            if x.get("outcome") == "post_merge_defect": L.append(f"- defect found after merge: {x.get('reason', '')[:200]}")
+            if x.get("outcome") == "withdrawn": L.append(f"- WITHDRAWN {x.get('t', '')[:10]}: criterion moved to #{x.get('superseded_by')} — {x.get('reason', '')[:400]}")
+        if st.get("pr_url"): L.append(f"- PR: {st['pr_url']}" + (" (merged)" if st.get("merged") else ""))
+        orm = task_dir(tid) / "owner-run.md"
+        if orm.exists(): L += ["- owner run:"] + ["  " + l for l in orm.read_text().splitlines()[1:] if l.strip()]
+        L.append("")
+    L += ["## totals", f"- subtasks {len(rows)}; notional agent spend ${total_cost:.2f} (API-equivalent; the owner ran on a subscription)", f"- false accepts: {sum(1 for _, _, st in rows if any(x.get('false_accept') for x in st.get('round_log', [])))}", f"- owner rejects: {sum(1 for _, _, st in rows for x in st.get('round_log', []) if x.get('outcome') == 'human_rejected')}"]
+    return scrub(c, "\n".join(L))
+
+def publish_files(c, rpath, branch, rel_files, subject, body):
+    """Commit the given files in the repo as the owner on a fresh branch from base, push, PR, squash-merge, pull base. Returns PR url or None."""
+    rp = Path(rpath)
+    sh(["git", "fetch", "-q", "origin"], cwd=rp, check=False, env=git_env(c))
+    sh(["git", "checkout", "-q", "-B", branch, f"origin/{c['base_branch']}"], cwd=rp)
+    sh(["git", "add", "--"] + rel_files, cwd=rp)
+    commit = ["git"] + git_id_flags(c) + ["commit", "-q", "-m", subject, "-m", body] + shlex.split(c.get("signoff_commit_flags", ""))
+    r = sh(commit, cwd=rp, check=False)
+    if r.returncode != 0:
+        sh(["git", "checkout", "-q", c["base_branch"]], cwd=rp, check=False); return None
+    push = sh(["git", "push", "-u", "origin", branch], cwd=rp, check=False, env=git_env(c))
+    if push.returncode != 0: die(f"push of {branch} failed: {push.stderr.strip()[-300:]}")
+    pr = sh(["gh", "pr", "create", "--title", subject, "--body", body, "--head", branch, "--base", c["base_branch"]], cwd=rp, check=False)
+    pr_url = next((l.strip() for l in (pr.stdout + pr.stderr).splitlines() if l.strip().startswith("http")), None)
+    merged = False
+    if pr_url:
+        for attempt in range(4):
+            mr = sh(gh_prefix(c) + f"gh pr merge {shlex.quote(pr_url)} --squash --delete-branch=false", check=False)
+            merged = mr.returncode == 0
+            if merged: break
+            time.sleep(3 * (attempt + 1))
+    sh(["git", "checkout", "-q", c["base_branch"]], cwd=rp, check=False)
+    if merged:
+        sh(["git", "pull", "-q", "--ff-only"], cwd=rp, check=False, env=git_env(c))
+        sh(["git", "push", "origin", "--delete", branch], cwd=rp, check=False, env=git_env(c))
+        sh(["git", "branch", "-D", branch], cwd=rp, check=False)
+    else: die(f"audit PR not merged automatically: {pr_url or 'no PR created'}. Merge it on GitHub, then re-run forge ticket close {key_from_branch(branch)}; the issue is still open.")
+    return pr_url
+
+def key_from_branch(branch): return branch.split("/")[-1].split("-")[0]
+
+def write_audit(c, key, rpath):
+    """docs/forge/<key>/ in the code repo: audit.md, plan.json, evidence summaries. Idempotent: skipped if already on base."""
+    rel_dir = Path("docs") / "forge" / str(key); out = Path(rpath) / rel_dir
+    if (out / "audit.md").exists() and not sh(["git", "status", "--porcelain", str(rel_dir)], cwd=rpath, check=False).stdout.strip():
+        print(f"audit already committed at {rel_dir}"); return None
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "audit.md").write_text(render_audit(c, key))
+    try: (out / "plan.json").write_text(scrub(c, json.dumps({k: v for k, v in read_plan(c, key).items() if not k.startswith("_ticket")}, indent=2)))
+    except Exception: pass
+    for t, s, st in all_tasks():
+        if s.get("jira") == key and (task_dir(t) / "owner-run.md").exists():
+            (out / f"owner-run-{t.split('--', 1)[-1]}.md").write_text(scrub(c, (task_dir(t) / "owner-run.md").read_text()))
+    files = [str(p.relative_to(rpath)) for p in out.rglob("*") if p.is_file()]
+    pre = commit_prefix(c, key, rpath)
+    return publish_files(c, rpath, f"forge/{key}-audit", files, f"{pre} audit: what forge did on this ticket", f"Audit log rendered by forge at ticket close: refinement, plan, every subtask's rounds, verdicts, rejects, PRs and owner runs. docs/{rel_dir.relative_to('docs')}/audit.md is the human-readable part.")
+
+# ---------------------------------------------------------------- human side
+
+def plan_order(c):
+    """{ticket key: {subtask id: index}} from each plan.json, so status lists subtasks in the order the planner meant them to run."""
+    out = {}
+    if plans_dir(c).exists():
+        for d in plans_dir(c).iterdir():
+            pj = d / "plan.json"
+            if pj.exists():
+                try: out[d.name] = {st["id"]: i for i, st in enumerate(json.loads(pj.read_text()).get("subtasks", []))}
+                except Exception: pass
+    return out
+
+def status_note(tid, spec, st, by_id):
+    """One short phrase per row: what the row is waiting for, or what you do about it."""
+    s = st["state"]
+    if s == "queued":
+        unmet = [d for d in spec.get("depends_on", []) if (by_id.get(d) or {}).get("state") not in (None, "approved", "withdrawn")]
+        return "after " + ", ".join(unmet) if unmet else "ready to start"
+    if s == "running": return f"{st.get('model')} since {str(st.get('started',''))[11:16]}Z"
+    if s == "needs_human": return "you: forge review --open"
+    if s == "owner": return ("you: forge owner run " + tid) if spec.get("owner_run") else ("you: do it by hand, then forge approve " + tid)
+    if s == "failed": return ("worker: " if any(str(st.get("reason") or "").startswith(k) for k in ("wrong repo", "already done", "blocked", "needs decision", "unknown")) else "env: ") + str(st.get("reason") or "")[:70]
+    if s == "approved": return "merged" if st.get("merged") else ("PR open" if st.get("pr_url") else "committed")
+    if s == "withdrawn": return f"superseded by #{st.get('superseded_by')}"
+    return ""
+
+def cmd_status(args):
+    c = cfg(); rows = all_tasks(); counts = {}
+    order = plan_order(c)
+    def key(row):
+        tid, spec, _ = row; k = spec.get("ticket") or tid.split("--")[0]
+        sub = tid.split("--", 1)[1] if "--" in tid else tid
+        return ((len(k), k), order.get(k, {}).get(sub, 999), sub)
+    rows = sorted(rows, key=key)
+    by_id = {}
+    for tid, spec, st in rows:
+        by_id[tid] = st; by_id[tid.split("--", 1)[1] if "--" in tid else tid] = st
+    closed = {k.stem for k in (ROOT / "tickets").glob("*.closed")} if (ROOT / "tickets").exists() else set()
+    show_all = "--all" in args
+    W = max([40] + [len(t) for t, _, _ in rows])
+    lines = []; hidden = {}; wdn = {}
+    for tid, spec, st in rows:
+        s = st["state"]; counts[s] = counts.get(s, 0) + 1
+        k = spec.get("ticket") or tid.split("--")[0]
+        if k in closed and not show_all:
+            hidden[k] = hidden.get(k, 0) + 1
+            if st.get("state") == "withdrawn": wdn[k] = wdn.get(k, 0) + 1
+            continue
+        rv = load(tid, "review.json") or {}
+        lines.append(f"{s:12} {tid:{W}} {(spec.get('repo') or '-')[:8]:8} {(spec.get('complexity') or 'med')[:3]}/{(st.get('model') or '-') + ('*' if spec.get('control') else ''):6} {f"r{st.get('rounds',0)}/red{st.get('red_rounds',0)}":10} {rv.get('risk') or '-':6} {spec['goal'][:44]:44}  {status_note(tid, spec, st, by_id)}")
+    print(f"{'state':12} {'task (ticket--subtask, plan order)':{W}} {'repo':8} {'cx/model':10} {'rework/red':10} {'risk':6} {'goal':44}  note")
+    print("\n".join(lines) or "(no tasks)")
+    for k, n in sorted(hidden.items(), key=lambda x: (len(x[0]), x[0])): print(f"{'closed':12} {k:{W}} {n - wdn.get(k, 0)} subtask(s) approved and merged" + (f", {wdn[k]} withdrawn" if wdn.get(k) else "") + "; issue closed (--all shows them)")
+    print("\n" + "  ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    print("next: " + next_step(c, rows))
+    lv = ROOT / "logs" / "loop.version"
+    if lv.exists():
+        v, pid, t = lv.read_text().split()
+        if not pid_alive(int(pid)): print(f"loop: not running (last v{v}); start it: forge loop")
+        elif v != VERSION: print(f"loop: running v{v} but v{VERSION} is installed; restart forge loop to use it")
+    if "--legend" in args or not lines:
+        print("legend: state = queued (waiting for a worker or a dependency) | running (worker on it) | needs_human (tech lead reviewed; your call) | owner (a step only you can do) | failed (environment, not code) | approved (your commit) | withdrawn (criterion moved to a later ticket)")
+        print("        cx/model = complexity the planner set / model it ran on (* = opus control arm)   rework/red = tech-lead reject rounds / red-test rounds   risk = tech lead's rating of the last diff")
+    if "--digest" in args:
+        waiting = [t for t, _, s in rows if s["state"] in HUMAN_STATES]
+        txt = (f"*forge* {datetime.now():%H:%M} — " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) +
+               (f"\nNeeds you: " + ", ".join(waiting) if waiting else "\nNothing waiting on you."))
+        rows = ledger_rows(); day = [r for r in rows if r["t"][:10] == datetime.now(timezone.utc).strftime("%Y-%m-%d")]
+        txt += f"\nAgent spend today: {round(sum(r['cost_usd'] for r in day),3)} USD notional over {len(day)} runs"
+        slack(c, txt); print("\n" + txt)
+
+def next_step(c, rows):
+    """The decision table, computed: what the human should do now, from task states alone."""
+    by = lambda state: [t for t, _, st in rows if st["state"] == state]
+    waiting, failed, owner, queued, running = by("needs_human"), by("failed"), by("owner"), by("queued"), by("running")
+    if waiting: return f"forge review --open   ({len(waiting)} waiting: {', '.join(waiting[:3])}{'…' if len(waiting) > 3 else ''}) then forge approve <id> --merge | forge reject <id> --tag …"
+    if failed:
+        st0 = next(st for t, _, st in rows if t == failed[0]); why = st0.get("reason") or ""
+        return f"{failed[0]} failed ({why[:70]}). " + failed_next(c, failed[0], st0)
+    if running: return f"nothing for you; {len(running)} running, {len(queued)} queued. Check back in a few minutes."
+    if queued and owner:
+        blockers = {d for t, s, _ in rows if t in queued for d in s.get("depends_on", [])}
+        if any(any(o.endswith("--" + d) for d in blockers) for o in owner): return f"queued tasks wait on your owner step {owner[0]}: forge owner run {owner[0]}"
+    if owner and not queued:
+        sp = next((s for t, s, _ in rows if t == owner[0]), {})
+        return f"owner step {owner[0]}: forge owner run {owner[0]}" if sp.get("owner_run") else f"owner step {owner[0]}: no script (planned before owner run existed); do tasks/{owner[0]}/spec.json steps by hand, then forge approve {owner[0]}"
+    if queued:
+        ready = [t for t, s, _ in rows if t in queued and deps_ok(s)]
+        if ready: return f"{len(ready)} queued and ready; the loop starts them on its next tick (every {c.get('loop_every', 120)}s). Still queued after 5 minutes means forge loop is not running: start it."
+        return f"{len(queued)} queued, all blocked on a dependency that is not approved yet (see the note column)."
+    tickets = {s.get("jira") for _, s, _ in rows if s.get("jira")}
+    done = [k for k in sorted(tickets, key=lambda x: (len(x), x)) if all(st["state"] in ("approved", "withdrawn") for _, s, st in rows if s.get("jira") == k) and not (ROOT / "tickets" / f"{k}.closed").exists()]
+    if done: return f"ticket {done[-1]} complete: forge ticket close {done[-1]}, then forge next <next issue number>"
+    return "nothing waiting; forge next <issue number> to start a ticket"
+
+def pick_next():
+    for tid, spec, st in all_tasks():
+        if st["state"] == "needs_human": return tid
+    return None
+
+def cmd_review(args):
+    ids = [a for a in args if not a.startswith("-")]
+    tid = ids[0] if ids else pick_next()
+    if not tid: print("nothing waiting for you"); return
+    spec = load(tid, "spec.json"); rv = load(tid, "review.json") or {}; st = load(tid, "state.json")
+    if not spec or not st: die(f"no task {tid} (forge status lists them)")
+    print(f"=== {tid}  [{st['state']}]  branch {st.get('branch')}  risk {rv.get('risk')}  verdict {rv.get('verdict')}")
+    print(f"GOAL: {spec['goal']}\n")
+    print("REVIEWER:\n  " + (rv.get("summary_for_human") or "").replace("\n", "\n  "))
+    for f in rv.get("findings", []): print(f"  - [{f['severity']}] {f.get('file')}:{f.get('line')} {f['issue']}")
+    print("\nWORKER SUMMARY:\n" + (task_dir(tid) / "summary.md").read_text())
+    p = task_dir(tid) / "patch.diff"
+    print(f"\nDIFF: {p}  ({sum(1 for l in p.read_text().splitlines() if l.startswith(('+','-')))} +/- lines)")
+    if "--diff" in args or "-d" in args: print(p.read_text())
+    if st["state"] in HUMAN_STATES and not st.get("review_started"):
+        set_state(tid, st["state"], review_started=now())
+    if "--open" in args or "-o" in args:
+        ed = cfg().get("editor", "code")
+        if shutil.which(ed.split()[0]):
+            # worktree has uncommitted changes only, so the editor's Source Control view IS the review diff
+            subprocess.Popen(shlex.split(ed) + ["-n", st["worktree"], str(task_dir(tid) / "summary.md"), str(task_dir(tid) / "review.json")])
+            print(f"opened in {ed}: worktree (see Source Control for the diff), summary, review")
+        else: print(f"editor '{ed}' not on PATH; set \"editor\" in forge.json")
+    if "--no-prompt" in args or not sys.stdin.isatty():
+        print(f"\n→ forge approve {tid} [-m \"msg\"] [--pr|--merge]    |    forge reject {tid} --tag defect|spec|style|env \"reason\""); return
+    review_prompt(tid, p, args)
+
+def review_prompt(tid, patch, args):
+    """Stay here until the task is decided or the human leaves. One key per action; nothing runs without it."""
+    flags = [x for x in args if x.startswith("-")]
+    while True:
+        a = input(f"\n[{tid}]  m merge (approve, PR, squash-merge)  |  p approve + PR  |  c approve, commit only  |  r reject  |  d diff  |  n next waiting  |  q quit  > ").strip().lower()
+        if a in ("q", ""): return
+        if a == "d": print(patch.read_text()); continue
+        if a == "n":
+            nxt = pick_next()
+            if not nxt or nxt == tid: print("nothing else waiting"); continue
+            cmd_review([nxt] + flags); return
+        if a in ("m", "p", "c"):
+            msg = input("  commit message (Enter = goal): ").strip()
+            extra = ["--merge"] if a == "m" else (["--pr"] if a == "p" else [])
+            cmd_approve([tid] + (["-m", msg] if msg else []) + extra)
+            nxt = pick_next()
+            if nxt and input(f"  next waiting: {nxt}. review it now? [Y/n] ").strip().lower() in ("", "y"): cmd_review([nxt] + flags)
+            return
+        if a == "r":
+            tag = input("  tag [defect|spec|style|env]: ").strip().lower()
+            if tag not in REJECT_TAGS: print("  tag must be one of " + ", ".join(REJECT_TAGS)); continue
+            reason = input("  reason (goes to the worker as feedback): ").strip()
+            if not reason: print("  a reason is required"); continue
+            cmd_reject([tid, "--tag", tag, reason]); return
+        print("  m, p, c, r, d, n or q")
+
+REVIEW_CAP_S = 45 * 60
+def elapsed_review(st):
+    """Seconds from the first `forge review` of this sitting to now, capped. Elapsed, not attention."""
+    if not st.get("review_started"): return None
+    t0 = datetime.strptime(st["review_started"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return min(int((datetime.now(timezone.utc) - t0).total_seconds()), REVIEW_CAP_S)
+
+def cmd_approve(args):
+    if not args: die("usage: forge approve <id> [-m msg] [--pr]")
+    c = cfg(); tid = args[0]; st = load(tid, "state.json"); spec = load(tid, "spec.json")
+    if st["state"] == "owner":
+        round_log(tid, round=0, outcome="owner_done"); set_state(tid, "approved", committed=now())
+        print(f"{tid} marked done by owner (no forge commit; your own PR carries it)"); return
+    if st["state"] not in HUMAN_STATES | {"reviewing"}: die(f"{tid} is {st['state']}, not awaiting approval")
+    wt = Path(st["worktree"])
+    goal = spec["goal"].strip()
+    if "-m" in args: subject, body_txt = args[args.index("-m") + 1], goal
+    else:
+        clause = re.split(r"[;:.]\s|\s(?:with|so that|and)\s", goal, maxsplit=1)[0].strip().rstrip(".,")
+        subject, body_txt = f"{spec['id']}: {clause[:60]}", goal
+    if spec.get("jira"):
+        pre = commit_prefix(c, spec["jira"], wt)
+        if not subject.startswith(pre): subject = f"{pre} {subject}"
+    msg = subject
+    (wt / "FORGE_SUMMARY.md").unlink(missing_ok=True)
+    sh(["git", "add", "-A"], cwd=wt)
+    ok, rn, re_ = check_identity(c, wt)
+    if identity(c) and not ok and "--trust-git-config" not in args:
+        print(f"note: repo resolves to {rn} <{re_}>; committing as forge.json identity {identity(c).get('name')} <{identity(c).get('email')}> instead")
+    commit = ["git"] + git_id_flags(c) + ["commit", "-q", "-m", subject, "-m", body_txt] + shlex.split(c.get("signoff_commit_flags", ""))
+    sh(commit, cwd=wt)   # author/committer/signing = forge.json identity if set, else your git config; nothing else is added
+    out = f"committed {st['branch']}"
+    push = sh(["git", "push", "-u", "origin", st["branch"]], cwd=wt, check=False, env=git_env(c))
+    pushed = push.returncode == 0
+    out += " + pushed" if pushed else f"\n(push failed, commit is local: {push.stderr.strip().splitlines()[-1] if push.stderr.strip() else 'no remote?'})"
+    pr_url = None; merged = False
+    want_pr = pushed and ("--pr" in args or "--merge" in args) and shutil.which("gh")
+    if want_pr:
+        r = sh(["gh", "pr", "create", "--title", subject, "--body", body_txt + "\n\n" + (task_dir(tid) / "summary.md").read_text(), "--head", st["branch"], "--base", c["base_branch"]], cwd=wt, check=False)
+        pr_url = next((l.strip() for l in (r.stdout + r.stderr).splitlines() if l.strip().startswith("http")), None)
+        out += f"\n{pr_url or r.stderr.strip()}"
+        if pr_url and "--merge" in args:
+            merged = False
+            for attempt in range(4):   # GitHub needs a moment to compute mergeability on a brand-new PR
+                mr = sh(gh_prefix(c) + f"gh pr merge {shlex.quote(pr_url)} --squash --delete-branch=false", check=False)
+                merged = mr.returncode == 0
+                if merged: break
+                time.sleep(3 * (attempt + 1))
+            out += "\nsquash-merged" if merged else f"\nmerge failed: {(mr.stderr or mr.stdout).strip().splitlines()[-1] if (mr.stderr or mr.stdout).strip() else '?'}"
+            if merged:
+                rp = st.get("repo_path") or c["repo"]
+                cur = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=rp, check=False).stdout.strip()
+                if cur == c["base_branch"]:
+                    pl = sh(["git", "pull", "-q", "--ff-only"], cwd=rp, check=False, env=git_env(c)); out += "; main pulled" if pl.returncode == 0 else "; pull main yourself (not fast-forward)"
+                sh(["git", "push", "origin", "--delete", st["branch"]], cwd=wt, check=False, env=git_env(c))
+    el = elapsed_review(st)
+    round_log(tid, round=st.get("rounds", 0), outcome="human_approved", after_verdict=st.get("last_verdict"), elapsed_review_s=el)
+    set_state(tid, "approved", committed=now(), review_started=None, pr_url=pr_url, merged=merged); print(out)
+    key = spec.get("jira")
+    if key:
+        link = next((l for l in out.splitlines() if l.startswith("http")), st["branch"])
+        jira_comment(c, key, f"{spec['id']}: {link}")
+        siblings = [s2 for t2, s2, st2 in all_tasks() if s2.get("jira") == key]
+        if siblings and all((load(t2, "state.json") or {}).get("state") == "approved" for t2, s2, _ in all_tasks() if s2.get("jira") == key):
+            jira_transition(c, key, "in_review")
+            jira_comment(c, key, "All subtasks committed and pushed; ready for review.")
+
+REJECT_TAGS = {"defect": "the code is wrong; counts as a false accept if the reviewer had approved it",
+               "spec": "the plan or ticket changed; not a reviewer miss",
+               "style": "naming, comments, structure; not a reviewer miss",
+               "env": "retry after an environment failure; counts toward nothing"}
+def retarget(c, tid, newr):
+    """Move a task to another mapped repo: drop its worktree and branch, keep its history. Returns the old repo name."""
+    st = load(tid, "state.json") or {}; spec = load(tid, "spec.json"); old = spec.get("repo")
+    if st.get("worktree") and Path(st["worktree"]).exists():
+        sh(["git", "worktree", "remove", "--force", st["worktree"]], cwd=st.get("repo_path") or c["repo"], check=False)
+        if st.get("branch"): sh(["git", "branch", "-D", st["branch"]], cwd=st.get("repo_path") or c["repo"], check=False)
+    spec["repo"] = newr; save(tid, "spec.json", spec)
+    set_state(tid, st.get("state", "queued"), worktree=None, branch=None, session_id=None, repo=newr, repo_path=repos(c)[newr])
+    print(f"{tid}: repo {old} -> {newr}; worktree and branch dropped, fresh start"); return old
+
+def no_changes_reason(tid, summary):
+    """Why a worker stopped with no diff: its own NO_CHANGES line, else what the guard blocked, else the first 'Not done' lines."""
+    m = re.search(r"^NO_CHANGES:\s*([\w-]+)\s*:?\s*(.*)$", summary, re.M)
+    if m: return m.group(1).lower(), m.group(2).strip()
+    log = (task_dir(tid) / "worker.log").read_text() if (task_dir(tid) / "worker.log").exists() else ""
+    blocked = re.findall(r"BLOCKED by forge policy: ([^\n\"]{0,160})", log)
+    if blocked: return "blocked", blocked[-1]
+    if re.search(r"another repo|other repo|lives in (the )?\S+ repo|outside (the|my|this) worktree", summary, re.I):
+        rn = re.search(r"\b(?:[\w]+-)?(" + "|".join(re.escape(k) for k in repos(cfg())) + r")\b", summary, re.I)
+        return "wrong-repo", (rn.group(1).lower() if rn else "")
+    sec = summary.split("## Not done", 1)
+    return "unknown", (sec[1].strip().splitlines()[0][:160] if len(sec) > 1 and sec[1].strip() else "worker wrote no reason")
+
+def cmd_why(args):
+    """forge why <id>: why a task is failed or waiting, from its own files, with the one command that moves it."""
+    if not args: die("usage: forge why <id>")
+    c = cfg(); tid = args[0]; st = load(tid, "state.json") or die(f"no task {tid}"); spec = load(tid, "spec.json")
+    summary = (task_dir(tid) / "summary.md").read_text() if (task_dir(tid) / "summary.md").exists() else ""
+    print(f"{tid}: {st.get('state')} in {spec.get('repo')}; reason: {st.get('reason') or '-'}")
+    log = (task_dir(tid) / "worker.log").read_text() if (task_dir(tid) / "worker.log").exists() else ""
+    blocked = re.findall(r"BLOCKED by forge policy: ([^\n\"]{0,200})", log)
+    if blocked: print("guard blocked the worker " + str(len(blocked)) + " time(s); last: " + blocked[-1])
+    if summary:
+        nd = summary.split("## Not done", 1)
+        print("worker's summary (not done / assumptions):\n  " + "\n  ".join((nd[1] if len(nd) > 1 else summary).strip().splitlines()[:12]))
+    if st.get("state") == "failed": print("do: " + failed_next(c, tid, st))
+
+def failed_next(c, tid, st):
+    why = st.get("reason") or ""
+    if why.startswith("wrong repo"):
+        rn = why.split(":", 1)[-1].strip(); cur = (load(tid, "spec.json") or {}).get("repo")
+        if rn == cur: return f"the task is already in {rn}; the worker had a stale worktree. forge reject {tid} --tag env \"retry\" (forge recreates the worktree)"
+        return f"forge reject {tid} --tag env --repo {rn} \"files live in {rn}\"" if rn in repos(c) else f"the worker says the files are in another repo but did not name a mapped one; forge reject {tid} --tag env --repo <server|android> \"...\""
+    if why.startswith("already done"): return f"the worker says main already has it: check, then forge rm {tid} if the task is redundant, or forge reject {tid} --tag spec \"<what is still missing>\""
+    if why.startswith("blocked"): return f"the guard stopped the worker ({why[9:90]}); if the plan told it to do that, forge reject {tid} --tag spec \"<do it inside the worktree instead: ...>\"; if it was the environment, --tag env \"retry\""
+    if why.startswith("needs decision"): return f"forge reject {tid} --tag spec \"<your decision>\"   (question: {why[15:200]})"
+    if "no changes" in why or why.startswith("unknown"): return f"forge why {tid} shows the worker's own words; then forge reject {tid} --tag spec \"<decision>\" or --tag env \"retry\""
+    return f"read tasks/{tid}/gate.log and worker.log, fix the cause, forge reject {tid} --tag env \"retry\""
+
+def cmd_reject(args):
+    if "--tag" not in args or len(args) < 4: die('usage: forge reject <id> --tag defect|spec|style|env "reason"\n  ' + "\n  ".join(f"{k}: {v}" for k, v in REJECT_TAGS.items()))
+    tid = args[0]; tag = args[args.index("--tag") + 1]
+    if tag not in REJECT_TAGS: die(f"tag must be one of {', '.join(REJECT_TAGS)}")
+    reason = [a for i, a in enumerate(args[1:], 1) if a not in ("--tag", "--repo") and args[i - 1] not in ("--tag", "--repo")][-1]
+    st = load(tid, "state.json") or {}
+    if "--repo" in args:
+        c = cfg(); newr = args[args.index("--repo") + 1]
+        if newr not in repos(c): die(f"--repo must be one of {', '.join(repos(c))}")
+        old = retarget(c, tid, newr); reason = f"[repo {old} -> {newr}] " + reason
+    (task_dir(tid) / "feedback.md").write_text(f"Human reviewer feedback ({tag}):\n{reason}\n")
+    false_accept = tag == "defect" and st.get("last_verdict") in ("APPROVE", "UNPARSED")
+    round_log(tid, round=st.get("rounds", 0), outcome="human_rejected", tag=tag, after_verdict=st.get("last_verdict"),
+              false_accept=false_accept, elapsed_review_s=elapsed_review(st), reason=reason[:200])
+    if tag == "env": set_state(tid, "queued", review_started=None, reason=None); print(f"↺ {tid} queued again (environment retry, not counted)"); return
+    set_state(tid, "queued", rounds=0, red_rounds=0, review_started=None, last_verdict=None)
+    print(f"↺ {tid} queued for rework [{tag}]" + ("  (false accept recorded)" if false_accept else ""))
+
+def cmd_rm(args):
+    """Delete a task that never produced accepted work: queued, failed or owner. Stops a running worker first. Approved tasks stay."""
+    if not args: die("usage: forge rm <id>")
+    tid = args[0]; st = load(tid, "state.json") or die(f"no task {tid}")
+    if st.get("state") in ("approved", "needs_human"): die(f"{tid} is {st['state']}; reject it or approve it, rm is for tasks nothing came out of")
+    if st.get("state") == "running" and st.get("pid") and pid_alive(st["pid"]):
+        try: os.killpg(st["pid"], 15)
+        except Exception: pass
+        print(f"stopped worker for {tid}")
+    if st.get("worktree") or st.get("branch"): cmd_clean([tid])
+    shutil.rmtree(TASKS / tid, ignore_errors=True); print(f"removed {tid}")
+
+def cmd_clean(args):
+    c = cfg()
+    targets = [t for t, _, s in all_tasks() if s["state"] == "approved"] if "--done" in args else args[:1]
+    for tid in targets:
+        st = load(tid, "state.json") or {}
+        rp = st.get("repo_path") or c["repo"]
+        if st.get("worktree") and Path(st["worktree"]).exists():
+            sh(["git", "worktree", "remove", "--force", st["worktree"]], cwd=rp, check=False)
+        if st.get("state") != "approved" and st.get("branch"):
+            sh(["git", "branch", "-D", st["branch"]], cwd=rp, check=False)
+        print(f"cleaned {tid}")
+
+# ---------------------------------------------------------------- main
+
+HELP = {
+  "next": """forge next KEY [--auto]
+Advance one ticket from issue to an approvable plan, stopping only where you must decide.
+  1. fetches the issue (title, body, comments) into tickets/KEY.md
+  2. refiner (sonnet) checks it is ready; questions go to the tech lead (opus), who drafts answers
+  3. you walk the answers: Enter accepts, type to override, h leaves it for you, q stops; accepted answers are posted on the issue
+  4. re-refines with the answers; accepts when READY; plans (opus) in the repo the ticket names; walks you through planner questions the same way
+Ends at: forge plan approve KEY. --auto accepts tech-lead answers of medium or high confidence without asking.
+Stops early with a line saying what to do; follow it.""",
+  "plan": """forge plan KEY [--repo NAME] | show | answer | revise KEY "fb" | extend KEY "defect" [--defect-in a,b] | approve | withdraw | list
+plan KEY       planner writes plans/KEY/plan.{json,md}; repo from the ticket's `repo:` line or --repo; refuses to guess when several are mapped
+answer KEY     tech lead drafts answers to the planner's questions, you confirm, planner revises
+answer KEY N "text"   answer planner question N yourself (no agents); then plan revise KEY
+revise KEY     re-plan with your feedback in prose
+extend KEY     after a merge turned out defective: planner adds NEW subtasks only; --defect-in records which subtasks produced it (false-accept count)
+approve KEY    turns subtasks into tasks; owner subtasks get state owner; the loop may now start workers. CHECK THE REPO COLUMN in forge status first.
+withdraw KEY   undo approve: stops any running worker, removes worktrees and the tasks; plan is a draft again
+Nothing runs until approve.""",
+  "refine": """forge refine KEY | show | post | accept | answer KEY [--auto]
+refine KEY     refiner re-reads the ticket and says READY or NOT_READY with questions (reporter = you; tech-lead = sourced by the tech lead)
+answer KEY     tech lead drafts answers; you confirm (Enter accept, type your own, h keep for later, q stop); posted on the issue
+answer KEY N "text"   answer question N yourself; posted and marked, no agents run. Use it for the ones you kept with h.
+accept KEY     mark READY so plan can run (forge next does this itself)
+Comments headed "Answers to refinement questions" count as part of the description on the next run.""",
+  "loop": """forge loop [--every 120]
+The loop loads forge's code once, at start: after installing a new forge, Ctrl-C it and start it again (forge version and forge status say when the running loop is older than the installed one).
+Runs ticks forever in the foreground (Ctrl-C stops). Each tick: reap finished workers (test gate -> tech-lead review -> needs_human, or rework), then start queued tasks whose dependencies are approved, up to max_workers.
+Restart it only when a drop changes loop code or model tiers; prompts, status, next and plan changes never need it.
+Do not start it before you have checked the repo column after plan approve.""",
+  "run": "forge run\nOne tick by hand: exactly what the loop would do now, once.",
+  "status": """forge status [--all] [--legend] [--digest]
+Tasks grouped by ticket in plan order with a note per row (what it waits for, or what you do). Closed tickets collapse to one line; --all expands them. Ends with next: the one thing to do now. --legend explains the columns. --digest also posts a summary to Slack.""",
+  "review": """forge review [id] [--open] [--diff] [--no-prompt]
+Shows the next task waiting for you (or the one named): tech-lead verdict, risk, findings, worker summary, then waits at a prompt.
+  m  approve, commit as you, push, open the PR and squash-merge (= forge approve <id> --merge)
+  p  approve, push and open the PR only           c  approve and commit only
+  r  reject: asks for the tag and the reason      d  print the diff here
+  n  move to the next task waiting               q  leave (nothing happens)
+After m/p/c it offers the next waiting task. --open also opens the worktree, summary and review in your editor. --no-prompt prints the commands and exits (for scripts).""",
+  "approve": """forge approve <id> [-m msg] [--pr | --merge]
+Commits the worktree as you (identity from forge.json), with the ticket key in the subject. --pr pushes and opens a PR; --merge also squash-merges, deletes the branch and pulls main. For an owner step it just records done.
+Forced-high risk (opus worker reviewed by sonnet) means read the diff yourself first.""",
+  "reject": """forge reject <id> --tag defect|spec|style|env "reason" [--repo NAME]
+Sends the task back. defect = code wrong (false accept if the tech lead had approved); spec = plan wrong; style; env = not the worker's fault, re-queued without counting. The reason goes to the worker as feedback.
+--repo NAME moves the task to another mapped repo (its files turned out to live there): the old worktree and branch are dropped and it starts fresh in the new repo.""",
+  "ticket": """forge ticket KEY | close KEY
+ticket KEY     fetch the issue (title, body, comments) into tickets/KEY.md
+close KEY      when every subtask is approved: verifies each PR merged, runs the repo's tests on main, closes the issue with the PR list. Nothing else closes issues.
+close KEY --superseded-by NEW --reason "..."
+               same, but owner steps still open (no PR) are withdrawn: their acceptance criterion moved to issue NEW. The audit and the closing comment record the reason. Worker subtasks must still be approved.""",
+  "clean": "forge clean <id> | --done\nRemoves worktrees (and branches if not approved). --done cleans every approved task. Safe after a merge.",
+  "finance": "forge finance report [--post]\nNotional API-equivalent spend per role and the outcomes table (false accepts, rework, cost by model tier). Cells with n<10 are not evidence.",
+  "add": "forge add \"<goal>\" --issue N --repo NAME [--accept \"<cmd>\"]\nOne task without a planner, default-tier model, tied to issue N and run in repo NAME (required when more than one repo is mapped). For chores, not features. --jira is accepted as an alias of --issue.",
+  "version": "forge version\nInstalled version and the version the running loop started with; a loop older than the install needs restarting.",
+  "why": "forge why <id>\nWhy a task is failed or waiting: the worker's NO_CHANGES line or its 'Not done' section, what the guard blocked, and the one command that moves it. Workers that stop without a diff must say why in a form forge can act on: wrong-repo (forge moves the task itself), already-done, blocked, needs-decision.",
+  "rm": "forge rm <id>\nDelete a task nothing came out of (queued, failed, owner): stops its worker if running, removes worktree and branch, deletes the task. Approved or needs_human tasks are refused; reject or approve those.",
+  "discover": "forge discover <decisions.md> --project NAME | answer NAME\nProduct-team pass over a decisions document: questions first, then backlog, ADRs, tests and costs. Optional; see README.",
+  "backlog": "forge backlog render|show|resolve|approve NAME\nResolve walks challenger findings into decisions; approve creates the issues, tickets/ and CLAUDE.md.",
+  "init": "forge init\nChecks claude and git, writes the worker settings and guard hook.",
+  "login": "forge login [--email ADDR] [--force]\nSigns forge in to the Claude account its agents use (workers, tech lead, planner, refiner, gate). Forge keeps that login in its own config directory (forge.json claude_home, default <forge>/account), separate from your own claude login, so the account you use in your shell or editor never changes which account forge bills. Switching: forge logout, then forge login. forge's own data (tasks, plans, logs, audits) is independent of the login.",
+  "logout": "forge logout\nSigns forge out of its Claude account; your own claude login is untouched.",
+  "whoami": "forge whoami\nWhich Claude login forge's agents are using right now.",
+  "owner": """forge owner run <id> [--base-url URL] [--dry-run] [--no-post]
+Runs an owner step the way the loop runs a worker: preflight (forge doctor checks the plan names), then the step's commands in the repo with output streamed and logged, pausing only for physical actions the plan declares (lock the phone, plug it in). It then reads the JUnit XML the plan names as evidence, judges each acceptance check (must_pass / must_not_run / may_fail by test class), writes tasks/<id>/owner-run.md and evidence/, posts the per-AC result on the issue, and approves the step on green.
+On red it prints the diagnosis (known failure shapes: no device, zero tests ran, cleartext blocked, no TCP path, version skew, dependency conflict, schema assets) and, when it is a code defect, the exact forge plan extend line, offering to run it. Environment problems point back at forge doctor.
+Owner steps planned before this existed have no script: it prints their prose steps and you approve by hand.
+Before running anything it checks the script against the repo: every test class a check names must exist, live in a source set forge knows how to run (test, androidTest), have a step that runs that source set marked expect_tests, and an evidence glob that covers its XML. Where the plan got that wrong it proposes the amendments (add the instrumented step, mark expect_tests, retarget the check, add the glob), applies them to this task on your yes, and records that it did.
+--from N resumes at step N keeping the evidence of earlier steps, so a failed device leg is rerun without the unit suite. --base-url overrides the server address (default http://127.0.0.1:8080 over adb reverse). --dry-run prints the commands without running.""",
+  "doctor": """forge doctor [check ...] [--base-url URL]
+Checks the environment and prints a fix for each failure. Default checks: tools (claude, git, gh), loop (is forge loop running), repos (paths exist, on the base branch, clean). Named extras: android_device (adb found, exactly one device authorised), local_server (health answers from this machine; adb reverse in place for a localhost base URL), docker. Owner steps run the checks their plan names before anything else.""",
+  "audit": "At forge ticket close, forge renders docs/forge/<key>/audit.md (refinement, plan, every subtask's models, rounds, verdicts, rejects, false accepts, PRs, owner runs, notional cost), plan.json and owner-run summaries into the code repo, commits them as you on forge/<key>-audit, opens the PR, squash-merges it and lists it in the closing comment. Set \"audit\": false in forge.json to turn it off.",
+}
+
+def cmd_help(args):
+    """forge help [command]: what a command does and when to use it; no argument lists them."""
+    if args and args[0] in HELP: print(HELP[args[0]]); return
+    if args: die(f"no help for '{args[0]}'; commands: {', '.join(sorted(HELP))}")
+    print(__doc__.rstrip()); print("\nforge help <command> for the long form. CHEATSHEET.md is the workflow by situation; README.md is the why.")
+
+CMDS = {k[4:]: v for k, v in globals().items() if k.startswith("cmd_")}
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"): sys.argv[1] = "help"
+    if len(sys.argv) >= 3 and sys.argv[2] in ("-h", "--help") and sys.argv[1] in HELP: print(HELP[sys.argv[1]]); sys.exit(0)
+    if len(sys.argv) < 2 or sys.argv[1] not in CMDS: print(__doc__); sys.exit(1)
+    try: CMDS[sys.argv[1]](sys.argv[2:])
+    except RuntimeError as e: die(str(e))

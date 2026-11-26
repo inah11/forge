@@ -1,0 +1,14 @@
+forge.json
+account/
+tasks/
+logs/
+plans/
+finance/
+tickets/
+templates/
+decisions/
+.worktrees/
+__pycache__/
+*.pyc
+*.zip
+.DS_Store

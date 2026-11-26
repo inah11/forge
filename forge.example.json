@@ -1,0 +1,30 @@
+{
+  "repos": {
+    "server": {"path": "~/projects/my-server", "test_cmd": "./gradlew test", "lint_cmd": ""},
+    "android": {"path": "~/projects/my-android", "test_cmd": "./gradlew testDebugUnitTest assembleDebugAndroidTest", "lint_cmd": "./gradlew lint", "seed": ["local.properties"]}
+  },
+  "base_branch": "main",
+  "branch_prefix": "feat/",
+  "tracker": {"kind": "github", "repo": "you/my-server", "gh_user": "you"},
+  "identity": {"name": "Your Name", "email": "you@example.com", "gpgsign": false},
+  "models": {"refiner": "sonnet", "planner": "opus", "tech_lead": "opus", "reviewer": "sonnet", "reviewer_high": "opus",
+             "worker_low": "haiku", "worker_medium": "sonnet", "worker_high": "opus"},
+  "max_workers": 3,
+  "worker_max_turns": 60,
+  "worker_timeout_min": 40,
+  "max_rework_rounds": 2,
+  "max_red_rounds": 3,
+  "opus_control_rate": 0.1,
+  "allowed_bash": ["./gradlew:*", "ls:*", "cat:*", "grep:*", "find:*", "sed:*", "python3:*", "adb:*"],
+  "require_refine": true,
+  "plans_dir": "~/.forge/plans/my-project",
+  "claude_home": "",
+  "audit": true,
+  "log_tag": "myapp",
+  "redact": [],
+  "strip_env": [],
+  "keep_env": [],
+  "slack_webhook": "",
+  "signoff_commit_flags": "",
+  "decisions_doc": ""
+}
