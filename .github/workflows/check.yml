@@ -26,5 +26,12 @@ jobs:
           echo '{"tool_name":"Edit","tool_input":{"file_path":"/tmp/wt/a.kt"}}' | python3 bin/guard.py
           echo '{"tool_name":"Edit","tool_input":{"file_path":"/tmp/main/a.kt"}}' | python3 bin/guard.py && exit 1 || test $? -eq 2
           echo '{"tool_name":"Bash","tool_input":{"command":"sed -i s/a/b/ /tmp/main/a.kt"}}' | python3 bin/guard.py && exit 1 || test $? -eq 2
+      - name: bin scripts are executable in git
+        run: |
+          for f in bin/forge bin/guard.py; do
+            mode=$(git ls-files -s "$f" | cut -d' ' -f1)
+            [ "$mode" = 100755 ] || { echo "$f is $mode in git, want 100755"; exit 1; }
+            [ -x "$f" ] || { echo "$f is not executable after checkout"; exit 1; }
+          done
       - name: help runs without a config
-        run: python3 bin/forge help | head -3
+        run: ./bin/forge help | head -3
