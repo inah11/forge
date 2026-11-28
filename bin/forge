@@ -72,11 +72,11 @@ ACTIVE_STATES = {"running", "reviewing"}
 def cfg():
     c = json.loads(CFG_PATH.read_text())
     rs = {k: v for k, v in (c.get("repos") or {}).items() if not k.startswith("_")}
-    if rs and not Path(os.path.expanduser(c.get("repo", ""))).is_dir():
+    if rs and not (c.get("repo") and Path(os.path.expanduser(c["repo"])).is_dir()):
         first = next(iter(rs.values())); first = first["path"] if isinstance(first, dict) else first
         c["repo"] = os.path.expanduser(first)   # first mapped repo is the default
-    if not Path(os.path.expanduser(c["repo"])).is_dir():
-        die(f"forge.json: repo '{c['repo']}' is not a directory (set repo, or repos)")
+    if not (c.get("repo") and Path(os.path.expanduser(c["repo"])).is_dir()):
+        die(f"forge.json: repo '{c.get('repo', '')}' is not a directory (set repo, or repos)")
     c["repo"] = os.path.expanduser(c["repo"])
     return c
 
