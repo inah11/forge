@@ -168,6 +168,8 @@ tasks/<id>/           spec.json state.json worker.log patch.diff summary.md revi
 .worktrees/<id>/      one git worktree per task (branch feat/<key>-<subtask>)
 ```
 
+Run the tests with `python3 -m unittest discover -s tests` (stdlib only, no install).
+
 ## Two setups from one checkout
 
 - **Personal / GitHub** (default config): `tracker.kind: github`, `repos: {"server": "~/projects/trainer-server", "android": "~/projects/trainer-android"}`, `require_refine: true`. Start with `forge discover`.
