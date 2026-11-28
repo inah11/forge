@@ -55,7 +55,12 @@ When every subtask of the ticket is approved:
 forge ticket close 3
 forge next 4
 ```
-`ticket close` checks every PR merged, runs the repo's tests on main, writes `docs/forge/<key>/audit.md` into the repo as its own PR, closes the issue. Nothing else closes issues.
+`ticket close` checks every PR merged, runs the repo's tests on main, writes `docs/forge/<key>/audit.md` and `tutorial.md` (the ticket in plain words) into the repo as its own PR, closes the issue. Nothing else closes issues. If the tutorial step fails the audit still ships; see `logs/tutorial-<key>-*.log`.
+
+A tutorial for a ticket closed earlier, or one you want redone:
+```
+forge tutorial 3
+```
 
 ## Before a device run
 
