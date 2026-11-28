@@ -30,6 +30,7 @@
   forge reject <id> "<reason>"    send back to the worker for rework
   forge clean <id>|--done         remove worktrees (and branches if not approved)
   forge owner run <id>            run an owner step's script, judge the JUnit evidence, record it, approve on green
+  forge tutorial <key>            regenerate docs/forge/<key>/tutorial.md (the ticket in plain words) and publish it on its own PR
   forge doctor [check ...]        environment preflight with a fix per failure (tools account loop repos android_device local_server docker)
   forge help [command]            long-form help; also forge <command> --help
 """
@@ -2031,26 +2032,96 @@ def publish_files(c, rpath, branch, rel_files, subject, body):
         sh(["git", "pull", "-q", "--ff-only"], cwd=rp, check=False, env=git_env(c))
         sh(["git", "push", "origin", "--delete", branch], cwd=rp, check=False, env=git_env(c))
         sh(["git", "branch", "-D", branch], cwd=rp, check=False)
+    elif branch.endswith("-tutorial"): die(f"tutorial PR not merged automatically: {pr_url or 'no PR created'}. Merge it on GitHub.")
     else: die(f"audit PR not merged automatically: {pr_url or 'no PR created'}. Merge it on GitHub, then re-run forge ticket close {key_from_branch(branch)}; the issue is still open.")
     return pr_url
 
 def key_from_branch(branch): return branch.split("/")[-1].split("-")[0]
 
+def plan_for_repo(c, key):
+    """plan.json as it lands in the repo: without the copied ticket text, scrubbed."""
+    return scrub(c, json.dumps({k: v for k, v in read_plan(c, key).items() if not k.startswith("_ticket")}, indent=2))
+
 def write_audit(c, key, rpath):
-    """docs/forge/<key>/ in the code repo: audit.md, plan.json, evidence summaries. Idempotent: skipped if already on base."""
+    """docs/forge/<key>/ in the code repo: audit.md, plan.json, evidence summaries, tutorial.md. Idempotent: skipped if already on base."""
     rel_dir = Path("docs") / "forge" / str(key); out = Path(rpath) / rel_dir
     if (out / "audit.md").exists() and not sh(["git", "status", "--porcelain", str(rel_dir)], cwd=rpath, check=False).stdout.strip():
         print(f"audit already committed at {rel_dir}"); return None
     out.mkdir(parents=True, exist_ok=True)
-    (out / "audit.md").write_text(render_audit(c, key))
-    try: (out / "plan.json").write_text(scrub(c, json.dumps({k: v for k, v in read_plan(c, key).items() if not k.startswith("_ticket")}, indent=2)))
+    audit_md = render_audit(c, key)
+    (out / "audit.md").write_text(audit_md)
+    try: (out / "plan.json").write_text(plan_for_repo(c, key))
     except Exception: pass
     for t, s, st in all_tasks():
         if s.get("jira") == key and (task_dir(t) / "owner-run.md").exists():
             (out / f"owner-run-{t.split('--', 1)[-1]}.md").write_text(scrub(c, (task_dir(t) / "owner-run.md").read_text()))
+    (out / "tutorial.md").unlink(missing_ok=True)   # a leftover from an earlier, unpublished run must not ship
+    if c.get("tutorial", True): write_tutorial(c, key, rpath, audit_md)
     files = [str(p.relative_to(rpath)) for p in out.rglob("*") if p.is_file()]
     pre = commit_prefix(c, key, rpath)
-    return publish_files(c, rpath, f"forge/{key}-audit", files, f"{pre} audit: what forge did on this ticket", f"Audit log rendered by forge at ticket close: refinement, plan, every subtask's rounds, verdicts, rejects, PRs and owner runs. docs/{rel_dir.relative_to('docs')}/audit.md is the human-readable part.")
+    return publish_files(c, rpath, f"forge/{key}-audit", files, f"{pre} audit: what forge did on this ticket", f"Audit log rendered by forge at ticket close: refinement, plan, every subtask's rounds, verdicts, rejects, PRs and owner runs. docs/{rel_dir.relative_to('docs')}/audit.md is the human-readable part" + ("; tutorial.md explains the ticket in plain words." if (out / "tutorial.md").exists() else "."))
+
+# ---------------------------------------------------------------- tutorial: the ticket explained in plain words, shipped with the audit
+
+TUTORIAL_TIMEOUT_S = 600
+TUTORIAL_DIFF_CHARS = 60000
+
+def ticket_diff(c, key):
+    """The ticket's code changes. Subtask branches are deleted once their PRs are squash-merged, so each merged PR's diff comes from GitHub."""
+    parts = []
+    for t, s, st in all_tasks():
+        if s.get("jira") == key and st.get("pr_url"):
+            r = sh(gh_prefix(c) + f"gh pr diff {shlex.quote(st['pr_url'])}", check=False)
+            parts.append(f"=== {t}: {st['pr_url']}\n" + (r.stdout if r.returncode == 0 else f"(diff unavailable: {r.stderr.strip()[:200]})"))
+    d = "\n\n".join(parts) or "(no pull requests on this ticket)"
+    return d if len(d) <= TUTORIAL_DIFF_CHARS else d[:TUTORIAL_DIFF_CHARS] + f"\n… (diff cut at {TUTORIAL_DIFF_CHARS} characters)"
+
+def write_tutorial(c, key, rpath, audit_md):
+    """docs/forge/<key>/tutorial.md from one model call (forge.json models.tutorial, default sonnet) on the audit, plan and diff.
+    Never raises: on a failure, timeout or empty answer it logs to logs/tutorial-<key>-*.log, warns and returns None. Returns the path written."""
+    model = c.get("models", {}).get("tutorial", "sonnet")
+    dest = Path(rpath) / "docs" / "forge" / str(key) / "tutorial.md"
+    LOGS.mkdir(parents=True, exist_ok=True)
+    log = LOGS / f"tutorial-{key}-{datetime.now():%m%d-%H%M%S}.log"
+    text, why, raw = "", "", ""
+    print(f"  tutorial ({model})…", flush=True)
+    try:
+        try: plan = plan_for_repo(c, key)
+        except (Exception, SystemExit): plan = "(no plan.json)"
+        body = f"AUDIT:\n{audit_md}\n\nPLAN:\n{plan}\n\nDIFF:\n{ticket_diff(c, key)}"
+        cmd = claude_cmd(c, PROMPTS / "tutorial.md", REVIEWER_SETTINGS, ["Read", "Glob", "Grep", "LS"], 5, model)
+        r = subprocess.run(cmd, input=body, cwd=rpath, text=True, capture_output=True, env=agent_env(c), timeout=TUTORIAL_TIMEOUT_S)
+        raw = (r.stdout or "") + "\n--- stderr ---\n" + (r.stderr or "")
+        ledger_record("tutorial", model, key, r.stdout)
+        if r.returncode != 0: why = f"claude exited {r.returncode}"
+        else:
+            text = (json.loads(r.stdout).get("result") or "").strip()
+            if not text: why = "empty answer"
+    except subprocess.TimeoutExpired: why = f"timed out after {TUTORIAL_TIMEOUT_S}s"
+    except Exception as e: why = f"{type(e).__name__}: {e}"
+    log.write_text(f"tutorial for {key} ({model}): {why or 'ok'}\n{raw}")
+    if why:
+        print(f"  tutorial skipped ({why}); see {log}", flush=True); return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(scrub(c, text) + "\n")
+    return dest
+
+def cmd_tutorial(args):
+    """forge tutorial KEY: regenerate one ticket's tutorial.md and publish it on its own PR. Runs even with "tutorial" or "audit" off: asking is explicit."""
+    if not args: die("usage: forge tutorial KEY")
+    c = cfg(); key = args[0]
+    specs = [s for t, s, st in all_tasks() if s.get("jira") == key]
+    if not specs: die(f"no tasks for {key}")
+    rname, rpath, _, _ = repo_for(c, specs[0])
+    cur = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=rpath, check=False).stdout.strip()
+    if cur != c["base_branch"]: die(f"{rpath} is on {cur}, not {c['base_branch']}; switch first")
+    sh(["git", "pull", "-q", "--ff-only"], cwd=rpath, check=False, env=git_env(c))
+    audit = Path(rpath) / "docs" / "forge" / str(key) / "audit.md"
+    dest = write_tutorial(c, key, rpath, audit.read_text() if audit.exists() else render_audit(c, key))
+    if not dest: die(f"no tutorial for {key}; the reason is in the newest logs/tutorial-{key}-*.log")
+    pre = commit_prefix(c, key, rpath)
+    url = publish_files(c, rpath, f"forge/{key}-tutorial", [str(dest.relative_to(rpath))], f"{pre} tutorial: this ticket in plain words", "Plain-language tutorial regenerated by forge tutorial from the audit, the plan and the merged diffs.")
+    print(url or f"{dest.relative_to(rpath)} is unchanged; nothing to publish")
 
 # ---------------------------------------------------------------- human side
 
@@ -2440,7 +2511,11 @@ Before running anything it checks the script against the repo: every test class 
 --from N resumes at step N keeping the evidence of earlier steps, so a failed device leg is rerun without the unit suite. --base-url overrides the server address (default http://127.0.0.1:8080 over adb reverse). --dry-run prints the commands without running.""",
   "doctor": """forge doctor [check ...] [--base-url URL]
 Checks the environment and prints a fix for each failure. Default checks: tools (claude, git, gh), loop (is forge loop running), repos (paths exist, on the base branch, clean). Named extras: android_device (adb found, exactly one device authorised), local_server (health answers from this machine; adb reverse in place for a localhost base URL), docker. Owner steps run the checks their plan names before anything else.""",
-  "audit": "At forge ticket close, forge renders docs/forge/<key>/audit.md (refinement, plan, every subtask's models, rounds, verdicts, rejects, false accepts, PRs, owner runs, notional cost), plan.json and owner-run summaries into the code repo, commits them as you on forge/<key>-audit, opens the PR, squash-merges it and lists it in the closing comment. Set \"audit\": false in forge.json to turn it off.",
+  "audit": "At forge ticket close, forge renders docs/forge/<key>/audit.md (refinement, plan, every subtask's models, rounds, verdicts, rejects, false accepts, PRs, owner runs, notional cost), plan.json, owner-run summaries and tutorial.md (the ticket in plain words; see forge help tutorial) into the code repo, commits them as you on forge/<key>-audit, opens the PR, squash-merges it and lists it in the closing comment. Set \"audit\": false in forge.json to turn it off; that also skips the tutorial.",
+  "tutorial": """forge tutorial <key>
+Regenerates docs/forge/<key>/tutorial.md and publishes it as you on forge/<key>-tutorial (PR, squash-merge), for tickets closed before tutorials existed or a tutorial you want redone. The repo must be on the base branch.
+The tutorial explains the ticket so a 5-year-old could follow it: the problem, what changed, how the design fits together, how the tests prove it, then a short "For grown-ups" list of the real files and ideas. One model call (forge.json models.tutorial, default sonnet, on forge's own login) reads the audit, plan.json and each merged PR's diff; prompts/tutorial.md is the prompt.
+At ticket close it is written automatically and ships inside the audit PR; it never shows in forge review. If the model fails or times out, the audit publishes without it and the reason is in logs/tutorial-<key>-*.log. "tutorial": false in forge.json stops the automatic one; this command still runs.""",
 }
 
 def cmd_help(args):
